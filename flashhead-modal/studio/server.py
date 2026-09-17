@@ -19,6 +19,7 @@ is a demo, not a service.
 
 from __future__ import annotations
 
+import faulthandler
 import hashlib
 import importlib.util
 import json
@@ -27,7 +28,9 @@ import os
 import queue as stdqueue
 import shutil
 import re
+import signal
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -559,11 +562,16 @@ def _await_start_slot(sess: LiveSession) -> None:
 
 def _auto_driver(sess: LiveSession) -> None:
     """Ask a question every `LIVE_CYCLE_S`, which is the cadence the capacity
-    numbers assume. Waits for the session to be live so the first question is not
-    swallowed by container start-up."""
-    while sess.state == "starting" and sess.state not in ("ended", "error"):
-        time.sleep(0.5)
-    while sess.auto and sess.state == "live":
+    numbers assume.
+
+    The first question waits for the container to say `live: ready`, not for the
+    studio to hold two HLS segments. Waiting for segments added ~4 s to the first
+    response for nothing: the playlist is an EVENT playlist with every segment
+    retained, so a viewer who attaches later still starts from the first frame,
+    and the container's ingest thread buffers audio that arrives before then."""
+    while not sess.started_live and sess.state not in ("ended", "error"):
+        time.sleep(0.2)
+    while sess.auto and sess.state in ("starting", "live"):
         q = INTERVIEW_QUESTIONS[sess.turns % len(INTERVIEW_QUESTIONS)]
         sess.turns += 1
         try:
@@ -571,7 +579,7 @@ def _auto_driver(sess: LiveSession) -> None:
         except Exception as exc:  # noqa: BLE001
             sess.log.append(f"auto say failed: {type(exc).__name__}: {exc}")
         for _ in range(int(LIVE_CYCLE_S * 2)):
-            if not (sess.auto and sess.state == "live"):
+            if not (sess.auto and sess.state in ("starting", "live")):
                 return
             time.sleep(0.5)
 
@@ -689,6 +697,31 @@ def _live_consumer(sess: LiveSession) -> None:
         (sess.dir / "session.json").write_text(json.dumps(sess.public(), ensure_ascii=False, indent=1))
 
 
+_outbox: stdqueue.Queue = stdqueue.Queue()
+
+
+def _put_async(item: dict, partition: str, label: str) -> None:
+    """Hand a queue put to the sender thread instead of waiting on Modal here.
+
+    A `progress.put` is a gRPC call, and a congested Modal client makes it slow
+    or hang. Called straight from a route it holds an anyio worker thread for
+    that whole time, and enough of those stall the whole studio. Order within a
+    session is preserved because one thread drains this queue in FIFO order."""
+    _outbox.put((item, partition, label))
+
+
+def _outbox_worker() -> None:
+    while True:
+        item, partition, label = _outbox.get()
+        try:
+            fh.progress.put(item, block=False, partition=partition)
+        except Exception as exc:  # noqa: BLE001
+            print(f"outbox: {label} 실패: {type(exc).__name__}: {exc}", flush=True)
+
+
+threading.Thread(target=_outbox_worker, daemon=True, name="modal-outbox").start()
+
+
 def _live_push_pcm(sess: LiveSession, pcm: bytes, label: str, tts_s: float = 0.0) -> float:
     """Send raw 16 kHz mono PCM to the container in ≤800 KB parts (Queue items are
     capped at 1 MiB); the last part carries `final` so the tail gets padded."""
@@ -696,8 +729,8 @@ def _live_push_pcm(sess: LiveSession, pcm: bytes, label: str, tts_s: float = 0.0
     part = 800_000
     parts = [pcm[j:j + part] for j in range(0, len(pcm), part)] or [b""]
     for j, chunk in enumerate(parts):
-        fh.progress.put({"type": "audio", "pcm": chunk, "final": j == len(parts) - 1},
-                        block=False, partition=f"{sess.id}:audio")
+        _put_async({"type": "audio", "pcm": chunk, "final": j == len(parts) - 1},
+                   f"{sess.id}:audio", f"audio {sess.id[:6]} {j + 1}/{len(parts)}")
     extra = f" (tts {tts_s:.1f}s)" if tts_s else " (tts 캐시)"
     sess.log.append(f"say: {seconds:.1f}s of speech pushed{extra} → \"{label[:40]}\"")
     return seconds
@@ -951,6 +984,23 @@ threading.Thread(target=_container_poller, daemon=True, name="container-poller")
 
 # ----------------------------------------------------------------------------
 app = FastAPI(title="FlashHead Studio")
+
+# Every route here is a sync `def`, so each in-flight request holds one of
+# anyio's worker threads — 40 by default. Six live sessions pull HLS segments
+# continuously while the page polls, and any handler that blocks holds its
+# thread for as long as it blocks. When all 40 are held the studio stops
+# answering *everything*, segments included, while looking idle. 200 gives the
+# demo room; `_put_async` below keeps the blocking calls off these threads.
+@app.on_event("startup")
+async def _widen_threadpool() -> None:
+    import anyio.to_thread
+
+    anyio.to_thread.current_default_thread_limiter().total_tokens = 200
+
+
+# `kill -USR1 <pid>` dumps every thread's stack into studio.log. Without this a
+# wedged studio can only be guessed at: py-spy needs root on macOS.
+faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True)
 
 
 class CreateJob(BaseModel):
@@ -1249,7 +1299,7 @@ def live_stop(sid: str) -> dict:
     if not sess:
         raise HTTPException(404, "no such session")
     if sess.state in ("starting", "live"):
-        fh.progress.put({"type": "end"}, block=False, partition=f"{sid}:audio")
+        _put_async({"type": "end"}, f"{sid}:audio", f"end {sid[:6]}")
         sess.state = "ending"
         sess.log.append("stop requested")
     return sess.public()
