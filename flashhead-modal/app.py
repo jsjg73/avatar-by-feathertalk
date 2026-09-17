@@ -45,6 +45,14 @@ SRC = "/root/SoulX-FlashHead"
 # → 1. Two concurrent speakers need a chunk at or under 0.48 s.
 GPU = os.environ.get("FLASHHEAD_GPU", "L4")
 
+# torch.compile. Upstream hardcodes it on for its realtime-streaming case —
+# one resident process, fixed shapes, thousands of chunks — which is exactly
+# what the live path became. It was turned off for the original use (offline
+# short clips, where a 7.8 s job spent 430 s compiling), and that reason no
+# longer covers live. The inductor and triton caches sit on a Volume, so the
+# cost should be paid once per image rather than once per container.
+COMPILE = os.environ.get("FLASHHEAD_COMPILE", "0") == "1"
+
 CACHE = "/cache"
 # Idle seconds before a warm container is torn down. Long enough to cover a demo
 # session's gaps, short enough that a forgotten toggle does not burn the budget.
@@ -94,11 +102,27 @@ image = (
     # cache did not help either -- `once` mode feeds different tensor shapes than
     # the `stream` runs that populated it. Placed last so cached layers survive.
     .run_commands(
-        f"sed -i 's/^COMPILE_MODEL = True/COMPILE_MODEL = False/; s/^COMPILE_VAE = True/COMPILE_VAE = False/' "
+        f"sed -i 's/^COMPILE_MODEL = {str(not COMPILE)}/COMPILE_MODEL = {str(COMPILE)}/; "
+        f"s/^COMPILE_VAE = {str(not COMPILE)}/COMPILE_VAE = {str(COMPILE)}/' "
         f"{SRC}/flash_head/src/pipeline/flash_head_pipeline.py",
-        f"grep -q '^COMPILE_MODEL = False' {SRC}/flash_head/src/pipeline/flash_head_pipeline.py "
-        f"&& grep -q '^COMPILE_VAE = False' {SRC}/flash_head/src/pipeline/flash_head_pipeline.py "
+        f"grep -q '^COMPILE_MODEL = {str(COMPILE)}' {SRC}/flash_head/src/pipeline/flash_head_pipeline.py "
+        f"&& grep -q '^COMPILE_VAE = {str(COMPILE)}' {SRC}/flash_head/src/pipeline/flash_head_pipeline.py "
         f"|| (echo 'compile flags NOT patched' && exit 1)",
+    )
+    # T2: drop the per-step timing instrumentation from generate(). It forces
+    # torch.cuda.synchronize() eight times per chunk — twice around every denoise
+    # step, then around decode, colour correction and the motion encode — purely
+    # so it can print each stage. On L4 a denoise step is ~105 ms and the stalls
+    # hide in it; on H100 a step is ~29 ms and they do not. _run_chunk's own
+    # swap/model/transfer split replaces what these prints told us.
+    .run_commands(
+        f"sed -i '/torch\\.cuda\\.synchronize()/d; "
+        f"s/^\\( *\\)print(f.\\[generate\\].*/\\1pass/' "
+        f"{SRC}/flash_head/src/pipeline/flash_head_pipeline.py",
+        f"! grep -q 'torch\\.cuda\\.synchronize()' {SRC}/flash_head/src/pipeline/flash_head_pipeline.py "
+        f"|| (echo 'sync instrumentation NOT stripped' && exit 1)",
+        f"python -c \"import ast,sys; ast.parse(open('{SRC}/flash_head/src/pipeline/flash_head_pipeline.py').read())\" "
+        f"|| (echo 'pipeline no longer parses after strip' && exit 1)",
     )
     .env(
         {
@@ -290,9 +314,18 @@ class Renderer:
                 time.sleep(20)
 
         threading.Thread(target=beat, daemon=True, name="ready-beat").start()
+        # Which attention kernel actually got picked, and at what precision: the
+        # image installs flash_attn but swallows a build failure, so without this
+        # a silent fall back to SDPA looks identical to success.
+        from flash_head.src.modules import flash_head_model as fhm
+
+        attn = ("SageAttention" if fhm.SAGE_ATTN_AVAILABLE else
+                "FlashAttention-3" if fhm.FLASH_ATTN_3_AVAILABLE else
+                "FlashAttention-2" if fhm.FLASH_ATTN_2_AVAILABLE else "SDPA")
         print(f"pipeline resident ({self.model_type}): weights {load_s:.0f}s + gpu warmup {gpu_s:.0f}s "
               f"+ io warmup {io_s:.0f}s · chunk {self.gen_ema:.2f}s → slot budget "
-              f"{max(1, int((p['frame_num'] - p['motion_frames_num']) / p['tgt_fps'] / self.gen_ema))}", flush=True)
+              f"{max(1, int((p['frame_num'] - p['motion_frames_num']) / p['tgt_fps'] / self.gen_ema))}\n"
+              f"  {GPU} · attn {attn} · dtype {self.pipeline.param_dtype} · compile {COMPILE}", flush=True)
 
     @modal.exit()
     def unload(self) -> None:
