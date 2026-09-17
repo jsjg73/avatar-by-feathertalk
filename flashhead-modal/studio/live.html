@@ -90,7 +90,7 @@
   <div class="gantt-head">
     <b>GPU 발화 점유</b>
     <span class="muted" id="ganttInfo">색이 칠해진 구간이 그 세션이 GPU를 쓰며 말한 시간입니다</span>
-    <button id="ganttZoom" class="ghost" style="margin-left:auto;padding:3px 10px;font-size:11.5px">최근 2분만</button>
+    <button id="ganttZoom" class="ghost" style="margin-left:auto;padding:3px 10px;font-size:11.5px">마지막 2분만</button>
   </div>
   <div class="gantt" id="gantt"></div>
 </footer>
@@ -137,7 +137,7 @@ $('#clearEnded').addEventListener('click', async () => {
 });
 $('#ganttZoom').addEventListener('click', () => {
   zoomRecent = !zoomRecent;
-  $('#ganttZoom').textContent = zoomRecent ? '전체 보기' : '최근 2분만';
+  $('#ganttZoom').textContent = zoomRecent ? '전체 보기' : '마지막 2분만';
   drawGantt(latest);
 });
 
@@ -203,17 +203,24 @@ function cell(s) {
 
 function drawGantt(list) {
   const now = Date.now() / 1000;
-  // the whole demo by default, not a scrolling window: nothing that happened
-  // may disappear off the left edge
-  const firsts = list.map(s => (s.spans[0] ? s.spans[0][0] : (s.started_live || s.created))).filter(Boolean);
-  const t0 = zoomRecent || !firsts.length ? now - WINDOW_S : Math.min(...firsts) - 5;
-  const span = Math.max(30, now - t0);
+  const anyLive = list.some(s => ['starting', 'live'].includes(s.state));
+  const starts = list.map(s => (s.spans[0] ? s.spans[0][0] : (s.started_live || s.created))).filter(Boolean);
+  const ends = list.flatMap(s => s.spans.map(([, b]) => b));
+  // The right edge follows the live edge only while something is live. Once the
+  // demo is over it stops at the last utterance — otherwise the chart keeps
+  // stretching with wall-clock time, squeezing the data into a sliver and making
+  // the occupancy figure decay for no reason.
+  const tEnd = anyLive ? now : (ends.length ? Math.max(...ends) + 2 : now);
+  const full0 = starts.length ? Math.min(...starts) - 2 : tEnd - WINDOW_S;
+  const t0 = zoomRecent ? tEnd - WINDOW_S : full0;
+  const span = Math.max(30, tEnd - t0);
   const pct = (t) => Math.max(0, Math.min(100, (t - t0) / span * 100));
   let html = '', busy = 0, recent = 0;
+  const rStart = tEnd - Math.min(WINDOW_S, span);
   for (const s of list) {
-    const bars = s.spans.filter(([a, b]) => b > t0).map(([a, b]) => {
-      busy += Math.min(b, now) - Math.max(a, t0);
-      if (b > now - WINDOW_S) recent += Math.min(b, now) - Math.max(a, now - WINDOW_S);
+    const bars = s.spans.filter(([a, b]) => b > t0 && a < tEnd).map(([a, b]) => {
+      busy += Math.min(b, tEnd) - Math.max(a, t0);
+      if (b > rStart) recent += Math.min(b, tEnd) - Math.max(a, rStart);
       return `<i style="left:${pct(a)}%;width:${Math.max(0.3, pct(b) - pct(a))}%" title="${(b - a).toFixed(1)}초"></i>`;
     }).join('');
     const live = ['starting', 'live'].includes(s.state);
@@ -222,16 +229,17 @@ function drawGantt(list) {
   }
   const step = span <= 180 ? 30 : span <= 600 ? 60 : span <= 1800 ? 300 : 600;
   let axis = '';
-  for (let t = Math.ceil(t0 / step) * step; t <= now; t += step) {
-    const ago = Math.round(now - t);
-    axis += `<i style="left:${pct(t)}%"></i><span style="left:${pct(t)}%">${ago ? '-' + ago + 's' : '지금'}</span>`;
+  for (let t = t0; t <= tEnd + 0.01; t += step) {
+    axis += `<i style="left:${pct(t)}%"></i><span style="left:${pct(t)}%">${fmt(t - full0)}</span>`;
   }
-  html += `<div class="g-label">시간</div><div class="g-axis">${axis}<div class="g-now" style="left:100%"></div></div>`;
+  if (anyLive) axis += `<div class="g-now" style="left:100%"></div>`;
+  html += `<div class="g-label">경과</div><div class="g-axis">${axis}</div>`;
   gantt.innerHTML = html;
   $('#ganttInfo').innerHTML =
-    `${zoomRecent ? `최근 ${WINDOW_S}초` : `전체 ${fmt(span)}`} · GPU 점유 <b>${Math.round(busy / span * 100)}%</b>` +
-    ` (최근 ${WINDOW_S}초 ${Math.round(recent / Math.min(WINDOW_S, span) * 100)}%) · ` +
-    `한 슬롯에 한 세션만 생성하므로 100%에 가까울수록 질문 시작이 밀립니다`;
+    `${zoomRecent ? `마지막 ${WINDOW_S}초` : `전체 ${fmt(span)}`}${anyLive ? ' · 진행 중' : ' · 종료'} · ` +
+    `GPU 점유 <b>${Math.round(busy / span * 100)}%</b>` +
+    (span > WINDOW_S ? ` (마지막 ${WINDOW_S}초 ${Math.round(recent / Math.min(WINDOW_S, span) * 100)}%)` : '') +
+    ` · 한 슬롯에 한 세션만 생성하므로 100%에 가까울수록 질문 시작이 밀립니다`;
 }
 
 async function poll() {
