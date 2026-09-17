@@ -15,6 +15,7 @@ Keep-warm is a runtime toggle, not a deploy-time constant — see
 L4 bills ~$0.80/hr, so the default is scale-to-zero after `SCALEDOWN_S`.
 """
 
+import json
 import pathlib
 import time
 
@@ -1138,6 +1139,193 @@ def _live_ffmpeg(hls: pathlib.Path, width: int, height: int, fps: int, sr: int, 
         str(hls / "index.m3u8"),
     ]
     return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=open(hls.parent / "ffmpeg.log", "wb"))
+
+
+# ---------------------------------------------------------------------------
+# Spike: can a pre-rendered idle loop hand off to live generation seamlessly?
+#
+# The live loop currently generates silent chunks while the candidate speaks —
+# measured 44-84% of a session's GPU work. If those frames can come from a
+# pre-rendered loop instead, GPUs are only needed while the avatar speaks.
+#
+# The model conditions each chunk on `latent_motion_frames` = VAE-encoded last 9
+# frames of the previous chunk, so injecting the loop's last frames there should
+# continue the video. The risk is the round trip: in production the loop lives as
+# an h264 file, so the frames come back quantised to uint8 and lossily coded.
+# Three conditions isolate each loss stage, same seed and same audio throughout:
+#   C (control) — the pipeline's own float latents, never left the GPU
+#   A           — re-encoded from uint8 frames held in memory (quantisation only)
+#   B           — re-encoded from frames decoded out of the saved mp4 (+ h264)
+@app.function(image=image, gpu=GPU, volumes={WEIGHTS: weights, CACHE: cache}, timeout=1800)
+def spike_seam(
+    image_bytes: bytes,
+    audio_bytes: bytes,
+    seed: int = 42,
+    idle_chunks: int = 10,
+    speech_chunks: int = 6,
+) -> dict:
+    import os
+    import sys
+    import tempfile
+    from collections import deque
+
+    os.chdir(SRC)
+    sys.path.insert(0, SRC)
+
+    import imageio
+    import librosa
+    import numpy as np
+    import torch
+
+    from flash_head.inference import (
+        get_audio_embedding,
+        get_base_data,
+        get_infer_params,
+        get_pipeline,
+        run_pipeline,
+    )
+
+    work = pathlib.Path(tempfile.mkdtemp(prefix="spike-"))
+    (work / "ref.png").write_bytes(image_bytes)
+    (work / "speech.wav").write_bytes(audio_bytes)
+
+    t0 = time.time()
+    pipeline = get_pipeline(world_size=1, ckpt_dir=CKPT, model_type="lite", wav2vec_dir=WAV2VEC)
+    get_base_data(pipeline, cond_image_path_or_dir=str(work / "ref.png"), base_seed=seed, use_face_crop=True)
+    p = get_infer_params()
+    sr, fps = p["sample_rate"], p["tgt_fps"]
+    frame_num, motion = p["frame_num"], p["motion_frames_num"]
+    slice_len = frame_num - motion
+    chunk_samples = slice_len * sr // fps
+    cached = p["cached_audio_duration"] * sr
+    end_idx = p["cached_audio_duration"] * fps
+    start_idx = end_idx - frame_num
+    print(f"pipeline ready in {time.time()-t0:.0f}s", flush=True)
+
+    def gen(audio_dq: deque, pcm: np.ndarray) -> np.ndarray:
+        """One chunk: push 0.96 s of audio, generate, return new frames (T,H,W,C) uint8."""
+        audio_dq.extend(pcm.tolist())
+        emb = get_audio_embedding(pipeline, np.array(audio_dq, dtype=np.float32), start_idx, end_idx)
+        return run_pipeline(pipeline, emb)[motion:].cpu().numpy().astype(np.uint8)
+
+    def encode_motion(frames_uint8: np.ndarray) -> torch.Tensor:
+        """uint8 (T,H,W,C) -> the latent the pipeline expects in latent_motion_frames."""
+        t = torch.from_numpy(np.ascontiguousarray(frames_uint8)).to(pipeline.device, dtype=pipeline.param_dtype)
+        t = (t / 255 - 0.5) * 2
+        return pipeline.vae.encode(t.permute(3, 0, 1, 2).unsqueeze(0))   # 1 C T H W
+
+    silence = np.zeros(chunk_samples, dtype=np.float32)
+
+    # ---- phase 1: the idle loop (pure silence), exactly as a live session idles
+    idle_dq: deque = deque([0.0] * cached, maxlen=cached)
+    idle_frames = [gen(idle_dq, silence) for _ in range(idle_chunks)]
+    idle = np.concatenate(idle_frames)
+    control_latent = pipeline.latent_motion_frames.clone()          # condition C
+    audio_state = list(idle_dq)                                     # the 8 s window at hand-off
+    loop_mp4 = work / "idle_loop.mp4"
+    with imageio.get_writer(str(loop_mp4), format="mp4", mode="I", fps=fps, codec="h264",
+                            ffmpeg_params=["-bf", "0", "-crf", "20", "-preset", "veryfast", "-pix_fmt", "yuv420p"]) as w:
+        for f in idle:
+            w.append_data(f)
+    reader = imageio.get_reader(str(loop_mp4))
+    decoded = np.stack([np.asarray(f) for f in reader])
+    reader.close()
+    print(f"idle loop: {len(idle)} frames, mp4 {loop_mp4.stat().st_size/1e6:.1f} MB, decoded {decoded.shape}", flush=True)
+
+    # ---- phase 2: the same speech from each hand-off condition
+    speech, _ = librosa.load(str(work / "speech.wav"), sr=sr, mono=True)
+    need = speech_chunks * chunk_samples
+    speech = np.concatenate([speech, np.zeros(max(0, need - len(speech)), dtype=np.float32)])[:need]
+
+    conditions = {
+        "C_control_float": None,                       # keep the pipeline's own latents
+        "A_uint8_memory": idle[-motion:],              # quantisation only
+        "B_h264_file": decoded[-motion:],              # quantisation + h264
+    }
+    out: dict = {}
+    per_chunk: dict = {}
+    for name, frames in conditions.items():
+        pipeline.latent_motion_frames = control_latent.clone() if frames is None else encode_motion(frames)
+        pipeline.generator.manual_seed(seed)           # identical noise in every condition
+        dq: deque = deque(audio_state, maxlen=cached)
+        got = [gen(dq, speech[i * chunk_samples : (i + 1) * chunk_samples]) for i in range(speech_chunks)]
+        per_chunk[name] = got
+        out[name] = np.concatenate(got)
+        print(f"{name}: generated {len(out[name])} frames", flush=True)
+
+    # ---- phase 3: measure
+    def mad(a: np.ndarray, b: np.ndarray) -> float:
+        return float(np.mean(np.abs(a.astype(np.int16) - b.astype(np.int16))))
+
+    last_idle = idle[-1]
+    intra_idle = float(np.mean([mad(idle[i], idle[i + 1]) for i in range(len(idle) - 1)]))
+    res: dict = {
+        "idle_frames": int(len(idle)),
+        "idle_mp4_mb": round(loop_mp4.stat().st_size / 1e6, 2),
+        "h264_roundtrip_mad": round(mad(idle[-motion:], decoded[-motion:]), 3),
+        "intra_frame_mad_idle": round(intra_idle, 2),
+        "conditions": {},
+    }
+    ctrl = out["C_control_float"]
+    for name, frames in out.items():
+        intra = float(np.mean([mad(frames[i], frames[i + 1]) for i in range(min(len(frames) - 1, 24))]))
+        res["conditions"][name] = {
+            # the jump across the hand-off, next to what an ordinary frame step looks like
+            "boundary_mad": round(mad(last_idle, frames[0]), 2),
+            "intra_frame_mad_speech": round(intra, 2),
+            "divergence_from_control": round(mad(frames, ctrl), 3),
+            "mean_rgb_first3": [round(float(frames[:3, :, :, c].mean()), 1) for c in range(3)],
+            "mean_rgb_last3": [round(float(frames[-3:, :, :, c].mean()), 1) for c in range(3)],
+            # does the injected error grow over a long speaking turn, or stay bounded?
+            "divergence_per_chunk": [round(mad(per_chunk[name][i], per_chunk["C_control_float"][i]), 2)
+                                     for i in range(len(per_chunk[name]))],
+        }
+    res["mean_rgb_last_idle"] = [round(float(last_idle[:, :, c].mean()), 1) for c in range(3)]
+
+    # ---- strips across the hand-off for the eye: 3 idle frames then 5 generated
+    strips = {}
+    for name, frames in out.items():
+        strip = np.concatenate(list(idle[-3:]) + list(frames[:5]), axis=1)
+        path = work / f"strip_{name}.png"
+        imageio.imwrite(str(path), strip)
+        strips[name] = path.read_bytes()
+    res["seconds"] = round(time.time() - t0, 1)
+    print("RESULT " + json.dumps(res), flush=True)
+    return {"metrics": res, "strips": strips, "idle_loop_mp4": loop_mp4.read_bytes(),
+            "speech_mp4": _write_mp4(work / "speech_B.mp4", np.concatenate([idle[-25:], out["B_h264_file"]]), fps)}
+
+
+def _write_mp4(path: pathlib.Path, frames, fps: int) -> bytes:
+    import imageio
+
+    with imageio.get_writer(str(path), format="mp4", mode="I", fps=fps, codec="h264",
+                            ffmpeg_params=["-bf", "0", "-crf", "18", "-pix_fmt", "yuv420p"]) as w:
+        for f in frames:
+            w.append_data(f)
+    return path.read_bytes()
+
+
+@app.local_entrypoint()
+def seam(image: str = "inputs/newscaster.png", audio: str = "inputs/korean_flashhead.wav",
+         out_dir: str = "spike-seam", speech_chunks: int = 25):
+    """대기 루프 → 생성 전환 이음새 스파이크. 결과는 <out_dir>/ 에 저장."""
+    import json as _json
+
+    d = pathlib.Path(out_dir)
+    d.mkdir(exist_ok=True)
+    r = spike_seam.remote(pathlib.Path(image).read_bytes(), pathlib.Path(audio).read_bytes(), speech_chunks=speech_chunks)
+    (d / "metrics.json").write_text(_json.dumps(r["metrics"], indent=1, ensure_ascii=False))
+    for name, data in r["strips"].items():
+        (d / f"strip_{name}.png").write_bytes(data)
+    (d / "idle_loop.mp4").write_bytes(r["idle_loop_mp4"])
+    (d / "handoff_B.mp4").write_bytes(r["speech_mp4"])
+    m = r["metrics"]
+    print(f"\nh264 왕복 손실(MAD): {m['h264_roundtrip_mad']}   대기 루프 프레임 간 변화: {m['intra_frame_mad_idle']}")
+    for name, c in m["conditions"].items():
+        pc = c["divergence_per_chunk"]
+        print(f"  {name:18s} 경계 점프 {c['boundary_mad']:6.2f} | 발화 중 프레임 간 {c['intra_frame_mad_speech']:6.2f} | 대조군 대비 {c['divergence_from_control']:7.3f}")
+        print(f"                     청크별 발산: {' '.join(f'{v:.1f}' for v in pc[:12])}{' …' if len(pc) > 12 else ''}  (마지막 {pc[-1]:.1f})")
+    print(f"\n저장: {d}/")
 
 
 # ---------------------------------------------------------------------------
