@@ -451,6 +451,10 @@ class LiveSession:
     said: list = field(default_factory=list)
     auto: bool = False              # drive the interview rhythm from the server
     turns: int = 0
+    # when this session held the GPU, as [start, end] epoch pairs — the Gantt below
+    # the grid is drawn straight from these
+    spans: list = field(default_factory=list)
+    container_t0: float = 0.0       # epoch of the container's own t=0 for this session
     started_live: float = 0.0
     finished: float = 0.0
     recording_url: str = ""
@@ -466,6 +470,7 @@ class LiveSession:
         d["elapsed"] = round((self.finished or time.time()) - self.created, 1)
         d["live_for"] = round((self.finished or time.time()) - self.started_live, 1) if self.started_live else 0.0
         d["gpu_ratio"] = round(self.speech_chunks / self.chunks, 3) if self.chunks else 0.0
+        d["spans"] = [[round(a, 2), round(b, 2)] for a, b in self.spans[-120:]]
         return d
 
 
@@ -526,11 +531,23 @@ def _live_consumer(sess: LiveSession) -> None:
                 return
             if item["type"] == "log":
                 line = item["line"]
+                ts = _TS_RE.match(line)
+                if ts and not sess.container_t0:
+                    # the container stamps every line with its own elapsed time;
+                    # anchoring it once puts every session on one wall clock
+                    sess.container_t0 = time.time() - float(ts.group(1))
                 m = _LIVE_RE.search(line)
                 if m:
                     sess.chunks = int(m.group(1)); sess.gen_s = float(m.group(3)); sess.behind_s = float(m.group(4)); sess.queued_s = float(m.group(5))
                     if m.group(2) == "speech":
                         sess.speech_chunks += 1
+                        if ts and sess.container_t0:
+                            at = sess.container_t0 + float(ts.group(1))
+                            step = SLICE_LEN / FPS
+                            if sess.spans and at - sess.spans[-1][1] <= step * 1.6:
+                                sess.spans[-1][1] = at + step      # same utterance, extend it
+                            else:
+                                sess.spans.append([at, at + step])
                 if "live: ready" in line and not sess.started_live:
                     sess.started_live = time.time()
                 sess.log.append(line[:160])
@@ -859,6 +876,13 @@ class WarmBody(BaseModel):
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(HERE / "index.html")
+
+
+@app.get("/live")
+def live_page() -> FileResponse:
+    """Dedicated screen for the concurrency demo: a grid of sessions plus a Gantt
+    of who held the GPU when."""
+    return FileResponse(HERE / "live.html")
 
 
 @app.get("/api/config")

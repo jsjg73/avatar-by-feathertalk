@@ -84,6 +84,9 @@
   .err { color: var(--err); font-size: 13px; margin-top: 8px; }
   .path { display: flex; align-items: center; gap: 10px; margin-top: 8px; font-size: 12px; color: var(--muted); flex-wrap: wrap; }
   .pro-slot { margin-top: 12px; border-top: 1px dashed var(--line); padding-top: 10px; }
+  .live-link { margin-bottom: 14px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .live-link span { color: var(--muted); font-size: 12.5px; }
+  .live-link a { margin-left: auto; color: var(--accent); text-decoration: none; font-size: 13px; font-weight: 550; }
   .live-panel { margin-bottom: 14px; }
   .live-total { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
   .live-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; margin-top: 14px; }
@@ -166,19 +169,10 @@
   </section>
 
   <section>
-    <div class="panel live-panel" id="livePanel">
-      <div class="live-head">
-        <b>라이브 세션</b>
-        <span class="live-model">
-          <label><input type="radio" name="liveModel" value="lite" checked> Lite · L4</label>
-          <label><input type="radio" name="liveModel" value="pro"> Pro · 2×H100 jp</label>
-        </span>
-        <span class="live-status" id="liveStatus">면접 리듬: 아바타 7초 발화 → 응시자 35초 (42초 주기)</span>
-        <span class="live-total" id="liveTotal"></span>
-        <button id="liveStopAll" class="ghost" hidden>전체 종료</button>
-      </div>
-      <div class="err" id="liveErr" hidden></div>
-      <div class="live-grid" id="liveGrid"></div>
+    <div class="panel live-link">
+      <b>라이브 세션</b>
+      <span>여러 세션을 동시에 켜고 GPU 점유를 보는 시연은 전용 화면에서 합니다.</span>
+      <a href="/live">동시 세션 시연 열기 →</a>
     </div>
     <div class="jobs" id="jobs"><div class="empty">아직 만든 영상이 없습니다.</div></div>
   </section>
@@ -453,130 +447,6 @@ function updatePro(el, j) {
   }
 }
 
-// --- live sessions (grid) -----------------------------------------------------
-const liveGrid = $('#liveGrid'), liveErrEl = $('#liveErr'), liveStatusEl = $('#liveStatus');
-const liveTotalEl = $('#liveTotal'), liveStopAll = $('#liveStopAll');
-let LIVE_MAX = 8, LIVE_SPEAK = 7, LIVE_CYCLE = 42;
-const players = new Map();          // session id -> the <video> we created once
-
-function liveError(msg) { liveErrEl.textContent = msg; liveErrEl.hidden = false; setTimeout(() => { liveErrEl.hidden = true; }, 6000); }
-
-async function addSession() {
-  const model = (document.querySelector('input[name="liveModel"]:checked') || {}).value || 'lite';
-  try {
-    const r = await fetch('/api/live', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-                                        body: JSON.stringify({ avatar: selectedAvatar, model, auto: true }) });
-    if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
-    await pollLive();
-  } catch (e) { liveError('세션 추가 실패: ' + e.message); }
-}
-
-async function stopSession(id) {
-  try { await fetch(`/api/live/${id}/stop`, { method: 'POST' }); } catch {}
-}
-
-liveStopAll.addEventListener('click', async () => {
-  const live = [...liveGrid.querySelectorAll('article.cell')].map(c => c.dataset.id);
-  await Promise.all(live.map(stopSession));
-});
-
-function attachLive(v, url) {
-  // follow the live edge: the scheduler keeps every session at realtime, so a
-  // short target latency is safe and makes contention visible rather than hidden
-  if (window.Hls && Hls.isSupported()) {
-    const h = new Hls({ liveSyncDuration: 1.5, liveMaxLatencyDuration: 4, maxBufferLength: 10 });
-    h.loadSource(url); h.attachMedia(v);
-    h.on(Hls.Events.MANIFEST_PARSED, () => v.play().catch(() => {}));
-    v.__hls = h;
-  } else { v.src = url; v.addEventListener('loadedmetadata', () => v.play().catch(() => {}), { once: true }); }
-}
-
-const LIVE_STATE_KO = { starting: 'GPU 준비 중', live: '라이브', ending: '종료 중', ended: '종료됨', error: '오류' };
-
-function cellFor(s) {
-  let el = liveGrid.querySelector(`article.cell[data-id="${s.id}"]`);
-  if (el) return el;
-  el = document.createElement('article');
-  el.className = 'cell'; el.dataset.id = s.id;
-  el.innerHTML = `
-    <div class="slot"><div class="placeholder">GPU 준비 중…</div></div>
-    <div class="cell-bar">
-      <span class="status"></span><span class="live" hidden>LIVE</span>
-      <span class="elapsed"></span>
-      <button class="ghost stop">종료</button>
-    </div>
-    <div class="cell-metrics">
-      <span>발화 <b class="m-speech">0</b>/<b class="m-chunks">0</b>청크</span>
-      <span>GPU <b class="m-gpu">0%</b></span>
-      <span>질문 <b class="m-turns">0</b>회</span>
-      <span>대기 음성 <b class="m-queued">0.0s</b></span>
-    </div>`;
-  el.querySelector('.stop').addEventListener('click', () => stopSession(s.id));
-  liveGrid.insertBefore(el, liveGrid.querySelector('.add-cell'));
-  return el;
-}
-
-function updateCell(el, s) {
-  const q = (sel) => el.querySelector(sel);
-  q('.status').className = 'status ' + s.state;
-  q('.status').textContent = LIVE_STATE_KO[s.state] || s.state;
-  q('.live').hidden = s.state !== 'live';
-  q('.elapsed').textContent = s.live_for ? fmt(s.live_for) : '';
-  q('.m-speech').textContent = s.speech_chunks;
-  q('.m-chunks').textContent = s.chunks;
-  q('.m-gpu').textContent = Math.round((s.gpu_ratio || 0) * 100) + '%';
-  q('.m-turns').textContent = s.turns;
-  q('.m-queued').textContent = (s.queued_s || 0).toFixed(1) + 's';
-  q('.stop').hidden = !['starting', 'live'].includes(s.state);
-
-  const slot = q('.slot');
-  if (s.hls_url && !players.has(s.id)) {
-    const v = document.createElement('video');
-    v.muted = true; v.playsInline = true; v.autoplay = true; v.controls = false;
-    v.addEventListener('click', () => { v.muted = !v.muted; });     // click a cell to listen to it
-    v.title = '클릭하면 이 세션의 소리를 켭니다';
-    slot.innerHTML = ''; slot.appendChild(v);
-    attachLive(v, s.hls_url);
-    players.set(s.id, v);
-  } else if (!s.hls_url && s.state === 'error') {
-    slot.innerHTML = `<div class="placeholder">${escapeHtml(s.error.slice(0, 120))}</div>`;
-  }
-}
-
-function addCellButton() {
-  let add = liveGrid.querySelector('.add-cell');
-  if (!add) {
-    add = document.createElement('button');
-    add.type = 'button'; add.className = 'add-cell';
-    add.innerHTML = '<span>+</span>세션 추가';
-    add.addEventListener('click', addSession);
-    liveGrid.appendChild(add);
-  }
-  return add;
-}
-
-async function pollLive() {
-  let list = [];
-  try { list = await (await fetch('/api/live')).json(); } catch { setTimeout(pollLive, 2000); return; }
-  const shown = list.filter(s => s.state !== 'ended' || (Date.now() / 1000 - s.finished) < 60);
-  const seen = new Set(shown.map(s => s.id));
-  addCellButton();
-  for (const s of shown) updateCell(cellFor(s), s);
-  for (const el of [...liveGrid.querySelectorAll('article.cell')]) {
-    if (!seen.has(el.dataset.id)) { players.delete(el.dataset.id); el.remove(); }
-  }
-  const active = shown.filter(s => ['starting', 'live'].includes(s.state));
-  const add = liveGrid.querySelector('.add-cell');
-  add.disabled = active.length >= LIVE_MAX;
-  add.innerHTML = active.length >= LIVE_MAX ? `<span>·</span>최대 ${LIVE_MAX}개` : '<span>+</span>세션 추가';
-  liveStopAll.hidden = active.length === 0;
-  const chunks = shown.reduce((a, s) => a + s.chunks, 0), speech = shown.reduce((a, s) => a + s.speech_chunks, 0);
-  liveTotalEl.textContent = active.length
-    ? `${active.length}/${LIVE_MAX} 세션 · 영상 ${(chunks * 0.96 / 60).toFixed(1)}분 · GPU ${(speech * 0.96 / 60).toFixed(1)}분 (${chunks ? Math.round(speech / chunks * 100) : 0}%)`
-    : '';
-  setTimeout(pollLive, active.length ? 1000 : 3000);
-}
-
 async function refreshOnce() {
   try { render(await (await fetch('/api/jobs')).json()); } catch {}
 }
@@ -622,7 +492,6 @@ async function refresh() {
   } catch { setTimeout(refresh, 4000); }
 }
 refresh();
-pollLive();
 </script>
 </body>
 </html>

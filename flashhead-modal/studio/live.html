@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FlashHead — 동시 세션 시연</title>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.15/dist/hls.min.js"></script>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --panel-2: #1e222b; --line: #2a2f3a;
+    --text: #e6e8ee; --muted: #8b93a7; --accent: #6ea8fe; --ok: #5ecf8a; --err: #ff7b7b;
+    --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--text); display: flex; flex-direction: column;
+         font: 15px/1.5 -apple-system, "Apple SD Gothic Neo", system-ui, sans-serif; }
+  header { padding: 14px 22px; border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  header h1 { margin: 0; font-size: 17px; font-weight: 650; letter-spacing: -0.01em; }
+  header .sub, .muted { color: var(--muted); font-size: 12.5px; }
+  header .right { margin-left: auto; display: flex; align-items: center; gap: 10px; }
+  a { color: var(--accent); text-decoration: none; }
+  select, button { font: inherit; }
+  select { background: var(--panel-2); color: var(--text); border: 1px solid var(--line); border-radius: 7px; padding: 5px 9px; font-size: 12.5px; }
+  button { background: var(--accent); color: #0b1020; border: 0; border-radius: 7px; padding: 6px 14px; font-weight: 650; cursor: pointer; }
+  button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--line); font-weight: 550; }
+  button:disabled { opacity: .45; cursor: default; }
+  .model { display: inline-flex; gap: 10px; font-size: 12px; color: var(--muted); }
+  .model label { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
+  .model input { accent-color: var(--accent); margin: 0; }
+  .err { color: var(--err); font-size: 13px; padding: 0 22px; }
+
+  main { flex: 1; overflow: auto; padding: 16px 22px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 12px; }
+  .cell { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; display: flex; flex-direction: column; }
+  .cell.speaking { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+  .cell video { width: 100%; aspect-ratio: 1; object-fit: cover; background: #000; display: block; }
+  .cell .ph { aspect-ratio: 1; display: grid; place-items: center; color: var(--muted); font-size: 12.5px; text-align: center; padding: 10px; }
+  .bar { display: flex; align-items: center; gap: 6px; padding: 7px 9px; font-size: 11.5px; color: var(--muted); }
+  .tag { font-size: 10.5px; padding: 2px 7px; border-radius: 999px; border: 1px solid var(--line); }
+  .tag.live { color: var(--ok); border-color: var(--ok); }
+  .tag.speaking { color: var(--accent); border-color: var(--accent); }
+  .tag.starting { color: var(--muted); }
+  .tag.ended, .tag.ending { color: var(--muted); }
+  .tag.error { color: var(--err); border-color: var(--err); }
+  .bar .t { margin-left: auto; font-variant-numeric: tabular-nums; }
+  .bar button { padding: 2px 8px; font-size: 11px; }
+  .metrics { padding: 0 9px 8px; font-size: 11px; color: var(--muted); display: grid; grid-template-columns: 1fr 1fr; gap: 2px 8px; font-variant-numeric: tabular-nums; }
+  .metrics b { color: var(--text); font-weight: 550; }
+  .add { border: 1px dashed var(--line); border-radius: 10px; display: grid; place-items: center; min-height: 190px; cursor: pointer;
+         background: none; color: var(--muted); font-weight: 400; }
+  .add:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  .add span { display: block; font-size: 30px; line-height: 1; margin-bottom: 6px; }
+
+  footer { border-top: 1px solid var(--line); background: var(--panel); padding: 12px 22px 16px; }
+  .gantt-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 8px; }
+  .gantt-head b { font-size: 13px; font-weight: 600; }
+  .gantt { display: grid; grid-template-columns: 96px 1fr; gap: 3px 10px; align-items: center; }
+  .g-label { font-size: 11px; color: var(--muted); text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .g-track { position: relative; height: 16px; background: var(--panel-2); border-radius: 4px; overflow: hidden; }
+  .g-track i { position: absolute; top: 2px; bottom: 2px; background: var(--accent); border-radius: 3px; }
+  .g-axis { position: relative; height: 16px; }
+  .g-axis span { position: absolute; top: 0; font-size: 10px; color: var(--muted); transform: translateX(-50%); }
+  .g-axis i { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--line); }
+  .g-now { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--err); opacity: .8; }
+</style>
+</head>
+<body>
+<header>
+  <h1>동시 세션 시연</h1>
+  <span class="sub" id="rhythm"></span>
+  <div class="right">
+    <span class="model">
+      <label><input type="radio" name="model" value="lite" checked> Lite · L4</label>
+      <label><input type="radio" name="model" value="pro"> Pro · 2×H100</label>
+    </span>
+    <select id="avatar"></select>
+    <span class="muted" id="totals"></span>
+    <button id="stopAll" class="ghost" hidden>전체 종료</button>
+    <a href="/">← 스튜디오</a>
+  </div>
+</header>
+<div class="err" id="err" hidden></div>
+
+<main><div class="grid" id="grid"></div></main>
+
+<footer>
+  <div class="gantt-head">
+    <b>GPU 발화 점유</b>
+    <span class="muted" id="ganttInfo">최근 120초 · 색이 칠해진 구간이 그 세션이 GPU를 쓰며 말한 시간입니다</span>
+  </div>
+  <div class="gantt" id="gantt"></div>
+</footer>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const grid = $('#grid'), gantt = $('#gantt'), errEl = $('#err');
+const WINDOW_S = 120;
+let MAX = 8, SPEAK = 7, CYCLE = 42;
+const players = new Map();
+let latest = [];
+
+function showErr(m) { errEl.textContent = m; errEl.hidden = false; setTimeout(() => errEl.hidden = true, 6000); }
+function fmt(s) { s = Math.round(s); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; }
+function esc(s) { return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+
+fetch('/api/config').then(r => r.json()).then(c => {
+  MAX = c.live_max_sessions; SPEAK = c.live_speak_s; CYCLE = c.live_cycle_s;
+  $('#rhythm').textContent = `아바타 ${SPEAK}초 질문 → 응시자 ${CYCLE - SPEAK}초 답변 (${CYCLE}초 주기) · 컨테이너 1대를 최대 ${MAX}세션이 공유`;
+}).catch(() => {});
+
+fetch('/api/avatars').then(r => r.json()).then(list => {
+  $('#avatar').innerHTML = list.map(a => `<option value="${a.id}">${esc(a.name)}</option>`).join('');
+}).catch(() => {});
+
+async function addSession() {
+  const model = document.querySelector('input[name="model"]:checked').value;
+  const avatar = $('#avatar').value;
+  try {
+    const r = await fetch('/api/live', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                        body: JSON.stringify({ avatar, model, auto: true }) });
+    if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+    poll();
+  } catch (e) { showErr('세션 추가 실패: ' + e.message); }
+}
+const stopOne = (id) => fetch(`/api/live/${id}/stop`, { method: 'POST' }).catch(() => {});
+$('#stopAll').addEventListener('click', () => latest.filter(s => ['starting', 'live'].includes(s.state)).forEach(s => stopOne(s.id)));
+
+function attach(v, url) {
+  if (window.Hls && Hls.isSupported()) {
+    const h = new Hls({ liveSyncDuration: 1.5, liveMaxLatencyDuration: 4, maxBufferLength: 10 });
+    h.loadSource(url); h.attachMedia(v);
+    h.on(Hls.Events.MANIFEST_PARSED, () => v.play().catch(() => {}));
+  } else { v.src = url; v.addEventListener('loadedmetadata', () => v.play().catch(() => {}), { once: true }); }
+}
+
+const STATE_KO = { starting: '준비 중', live: '라이브', ending: '종료 중', ended: '종료', error: '오류' };
+
+function cell(s) {
+  let el = grid.querySelector(`article[data-id="${s.id}"]`);
+  if (!el) {
+    el = document.createElement('article');
+    el.className = 'cell'; el.dataset.id = s.id;
+    el.innerHTML = `<div class="slot"><div class="ph">GPU 준비 중…</div></div>
+      <div class="bar"><span class="tag"></span><span class="who"></span><span class="t"></span><button class="ghost stop">종료</button></div>
+      <div class="metrics">
+        <span>발화 <b class="m-sp">0</b>/<b class="m-ch">0</b></span><span>GPU <b class="m-gpu">0%</b></span>
+        <span>질문 <b class="m-q">0</b>회</span><span>대기 <b class="m-w">0.0s</b></span>
+      </div>`;
+    el.querySelector('.stop').addEventListener('click', () => stopOne(s.id));
+    grid.insertBefore(el, grid.querySelector('.add'));
+  }
+  const q = (x) => el.querySelector(x);
+  const speaking = (s.spans.length && (Date.now() / 1000 - s.spans[s.spans.length - 1][1]) < 1.5);
+  el.classList.toggle('speaking', !!speaking && s.state === 'live');
+  q('.tag').className = 'tag ' + (speaking && s.state === 'live' ? 'speaking' : s.state);
+  q('.tag').textContent = speaking && s.state === 'live' ? '발화 중' : (STATE_KO[s.state] || s.state);
+  q('.who').textContent = s.avatar;
+  q('.t').textContent = s.live_for ? fmt(s.live_for) : '';
+  q('.m-sp').textContent = s.speech_chunks; q('.m-ch').textContent = s.chunks;
+  q('.m-gpu').textContent = Math.round((s.gpu_ratio || 0) * 100) + '%';
+  q('.m-q').textContent = s.turns; q('.m-w').textContent = (s.queued_s || 0).toFixed(1) + 's';
+  q('.stop').hidden = !['starting', 'live'].includes(s.state);
+  if (s.hls_url && !players.has(s.id)) {
+    const v = document.createElement('video');
+    v.muted = true; v.playsInline = true; v.autoplay = true;
+    v.title = '클릭하면 이 세션 소리를 켭니다';
+    v.addEventListener('click', () => { v.muted = !v.muted; });
+    const slot = q('.slot'); slot.innerHTML = ''; slot.appendChild(v);
+    attach(v, s.hls_url); players.set(s.id, v);
+  } else if (!s.hls_url && s.state === 'error') {
+    q('.slot').innerHTML = `<div class="ph">${esc((s.error || '').slice(0, 140))}</div>`;
+  }
+  return el;
+}
+
+function drawGantt(list) {
+  const now = Date.now() / 1000, t0 = now - WINDOW_S;
+  const pct = (t) => Math.max(0, Math.min(100, (t - t0) / WINDOW_S * 100));
+  let html = '';
+  let busy = 0;
+  for (const s of list) {
+    const bars = s.spans.filter(([a, b]) => b > t0).map(([a, b]) => {
+      busy += Math.min(b, now) - Math.max(a, t0);
+      return `<i style="left:${pct(a)}%;width:${Math.max(0.4, pct(b) - pct(a))}%"></i>`;
+    }).join('');
+    html += `<div class="g-label">${esc(s.avatar)} ${s.id.slice(0, 4)}</div><div class="g-track">${bars}</div>`;
+  }
+  // axis: a tick every 30 s, plus the live edge
+  let axis = '';
+  for (let t = 0; t <= WINDOW_S; t += 30) axis += `<i style="left:${t / WINDOW_S * 100}%"></i><span style="left:${t / WINDOW_S * 100}%">-${WINDOW_S - t}s</span>`;
+  html += `<div class="g-label">시간</div><div class="g-axis">${axis}<div class="g-now" style="left:100%"></div></div>`;
+  gantt.innerHTML = html;
+  const cap = list.length ? busy / WINDOW_S : 0;
+  $('#ganttInfo').textContent = `최근 ${WINDOW_S}초 · GPU 점유 ${Math.round(cap * 100)}% ` +
+    `(한 슬롯에 한 세션만 생성 가능하므로 100%에 가까울수록 질문 시작이 밀립니다)`;
+}
+
+async function poll() {
+  try { latest = await (await fetch('/api/live')).json(); } catch { setTimeout(poll, 2000); return; }
+  const now = Date.now() / 1000;
+  const shown = latest.filter(s => s.state !== 'ended' || (now - s.finished) < 90);
+  let add = grid.querySelector('.add');
+  if (!add) {
+    add = document.createElement('button');
+    add.type = 'button'; add.className = 'add';
+    add.addEventListener('click', addSession);
+    grid.appendChild(add);
+  }
+  const seen = new Set(shown.map(s => s.id));
+  shown.forEach(cell);
+  for (const el of [...grid.querySelectorAll('article.cell')]) {
+    if (!seen.has(el.dataset.id)) { players.delete(el.dataset.id); el.remove(); }
+  }
+  const active = shown.filter(s => ['starting', 'live'].includes(s.state));
+  add.disabled = active.length >= MAX;
+  add.innerHTML = add.disabled ? `<span>·</span>최대 ${MAX}개` : '<span>+</span>세션 추가';
+  $('#stopAll').hidden = active.length === 0;
+  const ch = shown.reduce((a, s) => a + s.chunks, 0), sp = shown.reduce((a, s) => a + s.speech_chunks, 0);
+  $('#totals').textContent = active.length
+    ? `${active.length}/${MAX} 세션 · 영상 ${(ch * 0.96 / 60).toFixed(1)}분 · GPU ${(sp * 0.96 / 60).toFixed(1)}분 (${ch ? Math.round(sp / ch * 100) : 0}%)`
+    : '세션 없음';
+  drawGantt(shown);
+  setTimeout(poll, active.length ? 1000 : 3000);
+}
+poll();
+setInterval(() => drawGantt(latest.filter(s => s.state !== 'ended' || (Date.now() / 1000 - s.finished) < 90)), 500);
+</script>
+</body>
+</html>
