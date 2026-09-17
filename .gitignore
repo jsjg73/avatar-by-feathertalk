@@ -47,3 +47,6 @@ flashhead-runpod/inputs/
 flashhead-modal/spike-seam/*.mp4
 
 flashhead-modal/spike-return/*.mp4
+
+# TTS 캐시 (재생성 가능, 음성·문장이 같으면 동일 파일)
+flashhead-modal/studio/tts-cache/

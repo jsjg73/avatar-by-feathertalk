@@ -19,6 +19,7 @@ is a demo, not a service.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import math
@@ -591,7 +592,7 @@ def _live_push_pcm(sess: LiveSession, pcm: bytes, label: str, tts_s: float = 0.0
     for j, chunk in enumerate(parts):
         fh.progress.put({"type": "audio", "pcm": chunk, "final": j == len(parts) - 1},
                         block=False, partition=f"{sess.id}:audio")
-    extra = f" (tts {tts_s:.1f}s)" if tts_s else ""
+    extra = f" (tts {tts_s:.1f}s)" if tts_s else " (tts 캐시)"
     sess.log.append(f"say: {seconds:.1f}s of speech pushed{extra} → \"{label[:40]}\"")
     return seconds
 
@@ -610,25 +611,57 @@ def _live_say_audio(sess: LiveSession, src: Path, name: str) -> None:
     src.unlink(missing_ok=True)
 
 
+TTS_CACHE = HERE / "tts-cache"
+TTS_CACHE.mkdir(exist_ok=True)
+_tts_locks: dict[str, threading.Lock] = {}
+_tts_locks_guard = threading.Lock()
+
+
+def _tts_pcm(text: str) -> tuple[bytes, float]:
+    """16 kHz mono PCM for `text`, synthesized once and kept on disk.
+
+    The interview questions repeat for every session and every cycle, and each
+    `say -v "Yuna (Premium)"` costs ~2-3 s of process and voice start-up. Caching
+    by (voice, text) turns that into one run per distinct sentence, ever, and
+    removes the delay before the avatar starts a question.
+    Returns (pcm, seconds spent synthesizing — 0 on a cache hit).
+    """
+    key = hashlib.sha256(f"{VOICE}|{text}".encode()).hexdigest()[:20]
+    wav = TTS_CACHE / f"{key}.wav"
+    with _tts_locks_guard:                 # two sessions asking the same question
+        lock = _tts_locks.setdefault(key, threading.Lock())
+    took = 0.0
+    with lock:
+        if not wav.exists():
+            t0 = time.time()
+            txt = TTS_CACHE / f"{key}.txt"
+            txt.write_text(text, encoding="utf-8")
+            tmp = wav.with_suffix(".tmp.wav")
+            subprocess.run(["say", "-v", VOICE, "-o", str(tmp), "--data-format", "LEI16@16000",
+                            "-f", str(txt)], check=True, capture_output=True, timeout=120)
+            tmp.replace(wav)
+            took = time.time() - t0
+    with wave.open(str(wav), "rb") as r:
+        return r.readframes(r.getnframes()), took
+
+
+def _prewarm_tts() -> None:
+    """Synthesize the question bank up front so the first question of a session is
+    not waiting on `say`."""
+    for q in INTERVIEW_QUESTIONS:
+        try:
+            _tts_pcm(q)
+        except Exception:  # noqa: BLE001 — a missing voice must not stop the server
+            return
+
+
 def _live_say(sess: LiveSession, text: str) -> None:
-    """TTS the text with ONE `say` call and push the PCM to the container. Runs in
-    a background thread so the request returns at once. One call, not one per
-    sentence: `say -v "Yuna (Premium)"` has ~4 s of process/voice start-up per
-    invocation, so splitting a paragraph into four sentences took 20 s in total
-    versus ~3 s for the whole paragraph."""
-    sess.dir.mkdir(parents=True, exist_ok=True)
-    n = len(sess.said)
+    """Push a sentence to the container as speech. The audio comes from the TTS
+    cache, so a repeated question costs nothing but the queue put."""
     entry = {"text": text, "seconds": None, "at": time.time()}
     sess.said.append(entry)
-    wav = sess.dir / f"say_{n:03d}.wav"
-    txt = sess.dir / f"say_{n:03d}.txt"
-    txt.write_text(text, encoding="utf-8")
-    t0 = time.time()
-    subprocess.run(["say", "-v", VOICE, "-o", str(wav), "--data-format", "LEI16@16000", "-f", str(txt)],
-                   check=True, capture_output=True, timeout=120)
-    with wave.open(str(wav), "rb") as r:
-        pcm = r.readframes(r.getnframes())
-    entry["seconds"] = round(_live_push_pcm(sess, pcm, text, tts_s=time.time() - t0), 2)
+    pcm, tts_s = _tts_pcm(text)
+    entry["seconds"] = round(_live_push_pcm(sess, pcm, text, tts_s=tts_s), 2)
 
 
 # ----------------------------------------------------------------------------
@@ -1166,6 +1199,9 @@ for meta in JOBS_DIR.glob("*/job.json"):
             jobs[j.id] = j
     except Exception:  # noqa: BLE001
         continue
+
+# after the definitions above, so the bank is ready before the first session
+threading.Thread(target=_prewarm_tts, daemon=True, name="tts-prewarm").start()
 
 app.mount("/avatars", StaticFiles(directory=AVATARS_DIR), name="avatars")
 app.mount("/static", StaticFiles(directory=HERE), name="static")
