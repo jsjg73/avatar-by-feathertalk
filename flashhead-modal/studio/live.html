@@ -120,7 +120,7 @@ function esc(s) { return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<'
 
 fetch('/api/config').then(r => r.json()).then(c => {
   MAX = c.live_max_sessions; SPEAK = c.live_speak_s; CYCLE = c.live_cycle_s;
-  $('#rhythm').textContent = `아바타 ${SPEAK}초 질문 → 응시자 ${CYCLE - SPEAK}초 답변 (${CYCLE}초 주기) · 컨테이너 1대를 최대 ${MAX}세션이 공유`;
+  $('#rhythm').textContent = `${c.gpu} · ${c.app} · 아바타 ${SPEAK}초 질문 → 응시자 ${CYCLE - SPEAK}초 답변 (${CYCLE}초 주기) · 컨테이너 1대를 최대 ${MAX}세션이 공유`;
 }).catch(() => {});
 
 fetch('/api/avatars').then(r => r.json()).then(list => {

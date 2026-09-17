@@ -50,3 +50,6 @@ flashhead-modal/spike-return/*.mp4
 
 # TTS 캐시 (재생성 가능, 음성·문장이 같으면 동일 파일)
 flashhead-modal/studio/tts-cache/
+
+# local pointer to which Modal deployment the studio drives
+flashhead-modal/studio/studio.env

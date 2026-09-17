@@ -11,6 +11,11 @@ port="${STUDIO_PORT:-8300}"
 # GPU time, upload images and pop Finder windows. STUDIO_HOST=0.0.0.0 opens it
 # to the LAN (e.g. to watch from a phone) — do that knowingly.
 host="${STUDIO_HOST:-127.0.0.1}"
+# Which deployment to drive. Put FLASHHEAD_APP / FLASHHEAD_GPU /
+# FLASHHEAD_MAX_SESSIONS in studio.env to keep a restart pointing at the same one
+# — without it a restart silently falls back to the L4 defaults, which is a nasty
+# surprise in the middle of a demo. Environment already set wins.
+[ -f "$here/studio.env" ] && . "$here/studio.env"
 py=/Users/kjs0703/playground/opentalk/opentalking/.venv/bin/python
 log="$here/studio.log"
 
@@ -44,6 +49,7 @@ start() {
     if curl -sf "http://127.0.0.1:$port/api/config" >/dev/null; then
       pid="$(lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | head -1)"
       echo "studio up: http://127.0.0.1:$port (bound to $host, pid $pid)"
+      echo "  대상: ${FLASHHEAD_APP:-flashhead} · ${FLASHHEAD_GPU:-L4} · 최대 ${FLASHHEAD_MAX_SESSIONS:-8}세션"
       echo "  응답이 없으면: ps -o stat= -p $pid  (T 면 정지) · kill -USR1 $pid → studio.log 에 스레드 스택"
       exit 0
     fi

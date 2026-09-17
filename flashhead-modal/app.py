@@ -24,14 +24,26 @@ from collections import deque
 
 import modal
 
-APP_NAME = "flashhead"
+# Both are overridable so a second, differently-sized deployment can be stood up
+# beside the working one instead of replacing it:
+#
+#   FLASHHEAD_APP=flashhead-h100 FLASHHEAD_GPU=H100 modal deploy app.py
+#   FLASHHEAD_APP=flashhead-h100 FLASHHEAD_GPU=H100 modal run app.py::mux --sessions 6
+#
+# The studio keeps pointing at the default app, so an experiment on a faster card
+# never disturbs a demo that is running.
+APP_NAME = os.environ.get("FLASHHEAD_APP", "flashhead")
 REPO = "https://github.com/Soul-AILab/SoulX-FlashHead.git"
 SRC = "/root/SoulX-FlashHead"
 
 # Modal has no RTX 4090 (upstream's benchmark card). L4 24 GB is the cheapest
 # 24 GB option; A10 is faster but pricier. L4's 300 GB/s bandwidth is well under
 # the 4090's ~1 TB/s, so expect the 96 FPS Lite figure not to carry over.
-GPU = "L4"
+#
+# The scheduler's per-slot budget is floor(0.96 s / chunk time), so the card
+# decides how many sessions may speak at the same moment: L4 measures 0.746 s
+# → 1. Two concurrent speakers need a chunk at or under 0.48 s.
+GPU = os.environ.get("FLASHHEAD_GPU", "L4")
 
 CACHE = "/cache"
 # Idle seconds before a warm container is torn down. Long enough to cover a demo
@@ -165,7 +177,7 @@ def _emit(job_id: str, line: str) -> None:
 # — and a listening avatar plays a pre-rendered loop, costing nothing. So N
 # sessions share one GPU as long as they rarely speak at the same moment; when
 # they do, the loser keeps playing its loop and its speech starts a beat later.
-LIVE_MAX_SESSIONS = 8
+LIVE_MAX_SESSIONS = int(os.environ.get("FLASHHEAD_MAX_SESSIONS", "8"))   # per container; a faster card holds more
 
 
 @app.cls(
@@ -260,6 +272,11 @@ class Renderer:
         self.slot_t0 = None
         self.slot = 0
         self.slot_overruns = 0             # slots where ongoing utterances exceeded the budget
+        # how many sessions actually generated speech in the same slot, counted per
+        # slot. This is the whole point of a faster card: on L4 the budget is 1 and
+        # this histogram can only ever fill index 1.
+        self.slot_hist = [0] * (LIVE_MAX_SESSIONS + 1)
+        self.slot_budget = 0
         # NOTE: gen_ema is seeded by the warm-up above; do not reset it here
         self.t_swap = self.t_pipe = self.t_xfer = 0.0   # _run_chunk's three parts
         ready_key = f"ready:{self.model_type}"
@@ -748,6 +765,9 @@ class Renderer:
             chosen |= {s["id"] for s in live if s["idle_loop"] is None}   # no loop to fall back on
             if len(ongoing) > budget:
                 self.slot_overruns += 1
+            self.slot_budget = budget
+            n_spk = sum(1 for s in speakers if s["id"] in chosen)
+            self.slot_hist[min(n_spk, LIVE_MAX_SESSIONS)] += 1
 
             for s in live:
                 try:
@@ -858,6 +878,7 @@ class Renderer:
                "wait_to_speak_max_s": max(waits) if waits else 0.0,
                "wait_to_speak_median_s": sorted(waits)[len(waits) // 2] if waits else 0.0,
                "ended_by": sess["reason"], "ffmpeg_rc": rc, "slot_overruns": self.slot_overruns - sess["overruns_at_open"],
+               "slot_budget": self.slot_budget, "slot_speakers": list(self.slot_hist),
                "peer_sessions": len(self.live_sessions) - 1,
                "seconds": round(time.time() - sess["t0"], 1)}
         try:
@@ -1751,8 +1772,27 @@ def mux(image: str = "inputs/newscaster.png", audio: str = "inputs/korean_short.
         print(f"  영상 청크 {tot_chunks} (= {tot_chunks*0.96/60:.1f}분 분량) · GPU 청크 {tot_gpu} "
               f"({tot_gpu/tot_chunks*100:.0f}%) · GPU가 만든 시간 {tot_gpu*0.96/60:.1f}분")
         print(f"  실시간 유지: 세션 길이가 요구하는 청크 {span/0.96:.0f} vs 실제 {[r['chunks'] for r in ok]}")
-        print(f"  GPU 점유율 {sum(r['gpu_chunks'] for r in ok)*0.82/span*100:.0f}% · "
-              f"세션당 GPU 비용은 {len(results)}분의 1")
+        # occupancy is GPU seconds over wall seconds, so it needs the measured chunk
+        # time of this card — not the 0.82 s an L4 once took. With a budget above 1
+        # the old constant read over 100%, which is not a thing GPU time can do.
+        gens = sorted(r["gen_median_s"] for r in ok if r.get("gen_median_s"))
+        gen = gens[len(gens) // 2] if gens else 0.0
+        print(f"  GPU 점유율 {sum(r['gpu_chunks'] for r in ok)*gen/span*100:.0f}% "
+              f"(청크 {gen:.3f}s 기준) · 세션당 GPU 비용은 {len(results)}분의 1")
+        # the histogram is container-wide, so any session's copy is the whole run's
+        hist = next((r.get("slot_speakers") for r in ok if r.get("slot_speakers")), None)
+        if hist:
+            budget = next(r.get("slot_budget") for r in ok if r.get("slot_speakers"))
+            slots = sum(hist) or 1
+            spoken = sum(hist[1:])
+            print(f"\n=== 동시 발화 (슬롯당 예산 {budget})")
+            print(f"  발화가 있었던 슬롯 {spoken} / 전체 {slots}")
+            for n, c in enumerate(hist):
+                if c and n:
+                    print(f"    {n}개 세션이 동시에 발화: {c:5d} 슬롯 ({c/spoken*100:4.1f}% of 발화 슬롯)")
+            top = max((n for n, c in enumerate(hist) if c), default=0)
+            print(f"  최대 동시 발화 {top}개 · 평균 {sum(n*c for n, c in enumerate(hist))/spoken:.2f}개"
+                  if spoken else "  발화 없음")
 
 
 @app.local_entrypoint()

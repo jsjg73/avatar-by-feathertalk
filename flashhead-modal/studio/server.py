@@ -417,7 +417,10 @@ LIVE_DIR.mkdir(exist_ok=True)
 LIVE_CHUNK_SAMPLES = SLICE_LEN * 16000 // FPS          # 15360 samples = 0.96 s
 LIVE_IDLE_TIMEOUT_S = 600.0
 # One container serves several sessions (app.py: @modal.concurrent(max_inputs=8)).
-LIVE_MAX_SESSIONS = 8
+# follow the container's own cap: app.py sets @modal.concurrent(max_inputs=…)
+# from it, and a studio that let more sessions through than the container
+# accepts would simply queue them outside the scheduler
+LIVE_MAX_SESSIONS = fh.LIVE_MAX_SESSIONS
 # The interview rhythm we are modelling: the avatar asks for ~7 s, the candidate
 # answers for ~35 s. That 1-in-6 speaking ratio is what sets how many sessions
 # fit on one GPU, so the demo drives it rather than leaving it to hand-typing.
