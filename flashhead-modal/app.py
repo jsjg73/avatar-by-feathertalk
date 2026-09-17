@@ -210,7 +210,12 @@ class Renderer:
         p = get_infer_params()
         n = p["frame_num"] * p["sample_rate"] // p["tgt_fps"]
         emb = get_audio_embedding(self.pipeline, np.zeros(n, dtype=np.float32))
+        t_gen = time.time()
         video = run_pipeline(self.pipeline, emb[:, : p["frame_num"]].contiguous())
+        # seed the per-slot budget's estimate: the warm-up generation is the same
+        # work a live chunk is, so the scheduler should not have to guess on its
+        # first slot (its budget is floor(slot / this))
+        self.gen_ema = time.time() - t_gen     # seeds the scheduler's per-slot budget
         gpu_s = time.time() - t1
         # librosa JIT-compiles (numba) on first use and imageio spins up its
         # ffmpeg plugin on first write — together ~25 s on a fresh container.
@@ -249,7 +254,7 @@ class Renderer:
         self.sched_guard = threading.Lock()
         self.slot_t0 = None
         self.slot = 0
-        self.gen_ema = 0.0                 # measured chunk time; sets the per-slot GPU budget
+        # NOTE: gen_ema is seeded by the warm-up above; do not reset it here
         ready_key = f"ready:{self.model_type}"
 
         def beat() -> None:
@@ -261,7 +266,9 @@ class Renderer:
                 time.sleep(20)
 
         threading.Thread(target=beat, daemon=True, name="ready-beat").start()
-        print(f"pipeline resident ({self.model_type}): weights {load_s:.0f}s + gpu warmup {gpu_s:.0f}s + io warmup {io_s:.0f}s", flush=True)
+        print(f"pipeline resident ({self.model_type}): weights {load_s:.0f}s + gpu warmup {gpu_s:.0f}s "
+              f"+ io warmup {io_s:.0f}s · chunk {self.gen_ema:.2f}s → slot budget "
+              f"{max(1, int((p['frame_num'] - p['motion_frames_num']) / p['tgt_fps'] / self.gen_ema))}", flush=True)
 
     @modal.exit()
     def unload(self) -> None:
@@ -329,7 +336,14 @@ class Renderer:
             if drop_motion:
                 video = video[pl.motion_frames_num:]
             frames = video.cpu().numpy().astype(np.uint8)
-        return frames, time.time() - t0, t0 - w0
+        gen = time.time() - t0
+        # Record the measurement here, where it is taken: every generation path
+        # goes through this method (warm-up, idle-loop render, clip render, the
+        # scheduler). Keeping it in the scheduler alone threw away the ~11
+        # measurements a container makes before its first live chunk, leaving the
+        # per-slot budget to be computed from an empty estimate.
+        self.gen_ema = 0.9 * self.gen_ema + 0.1 * gen if self.gen_ema else gen
+        return frames, gen, t0 - w0
 
     def _chunk(self, sess: dict, audio_window, start_idx: int, end_idx: int):
         """`_run_chunk` for the streaming path: build the rolling-window embedding first."""
@@ -689,8 +703,12 @@ class Renderer:
             behind = now - target
             self.slot += 1
 
-            # how many generations fit in a slot, from the generation time we measure
-            budget = max(1, int(chunk_s / max(0.05, self.gen_ema)))
+            # How many generations fit in a slot, from the generation time we
+            # measure. Before any measurement exists, admit one: the old fallback
+            # divided by 0.05 s and so advertised a budget of 19, which admitted
+            # every waiting session into a single slot and then preempted all but
+            # the first once the real 0.8 s landed a slot later.
+            budget = max(1, int(chunk_s / self.gen_ema)) if self.gen_ema else 1
             speakers = [s for s in live if s["pending"]]
             for s in speakers:
                 if s["want_since"] is None:
@@ -763,7 +781,6 @@ class Renderer:
                     sess["motion"] = self.pipeline.vae.encode(((t / 255 - 0.5) * 2).permute(3, 0, 1, 2).unsqueeze(0))
                 sess["speaking"] = True
             frames, gen, _ = self._chunk(sess, sess["audio_dq"], sess["audio_start_idx"], sess["audio_end_idx"])
-            self.gen_ema = 0.9 * self.gen_ema + 0.1 * gen if self.gen_ema else gen
             st["gen_s"].append(round(gen, 3))
 
         sess["vq"].put(frames)
