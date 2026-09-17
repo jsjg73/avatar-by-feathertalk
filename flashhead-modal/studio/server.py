@@ -426,6 +426,10 @@ LIVE_MAX_SESSIONS = fh.LIVE_MAX_SESSIONS
 # fit on one GPU, so the demo drives it rather than leaving it to hand-typing.
 LIVE_SPEAK_S = 7.0
 LIVE_CYCLE_S = 42.0
+# One scripted session is (아바타 발화 → 응시자 발화) × 3, then a closing avatar
+# turn: four avatar utterances, three candidate gaps, then the session ends.
+# Anything longer only repeats what the first cycles already showed.
+LIVE_TURNS = 4
 # Sessions start one at a time. Each start uploads the avatar PNG (~0.8 MB) in the
 # spawn payload, so six "+" clicks in two seconds push ~5 MB through one Modal
 # client at once — enough for a 1-second QueueGet to miss its deadline.
@@ -603,6 +607,35 @@ def _await_start_slot(sess: LiveSession) -> None:
         _live_last_start = time.time()
 
 
+def _live_end(sess: LiveSession) -> None:
+    """Tell the container this session is done. Safe to call twice."""
+    if sess.state in ("starting", "live"):
+        _put_async({"type": "end"}, f"{sess.id}:audio", f"end {sess.id[:6]}")
+        sess.state = "ending"
+        sess.log.append("stop requested")
+
+
+def _await_speech_drained(sess: LiveSession, timeout_s: float = 90.0) -> None:
+    """Wait until the container has played out everything queued for this session.
+
+    Ending a session discards whatever audio it still holds, so closing right
+    after pushing the last question would cut the avatar off mid-sentence. The
+    container reports its queue in every chunk line; speech is done when that
+    reaches zero and no further speech chunk arrives."""
+    t0, last, quiet = time.time(), sess.speech_chunks, 0.0
+    while time.time() - t0 < timeout_s:
+        time.sleep(0.5)
+        if sess.state in ("ended", "error"):
+            return
+        if sess.speech_chunks != last:
+            last, quiet = sess.speech_chunks, 0.0
+            continue
+        quiet += 0.5
+        if quiet >= 2.5 and sess.speech_chunks and sess.queued_s <= 0.05:
+            return
+    sess.log.append(f"auto: 마지막 발화가 {timeout_s:.0f}s 안에 끝나지 않아 그대로 종료한다")
+
+
 def _auto_driver(sess: LiveSession) -> None:
     """Ask a question every `LIVE_CYCLE_S`, which is the cadence the capacity
     numbers assume.
@@ -621,6 +654,12 @@ def _auto_driver(sess: LiveSession) -> None:
             _live_say(sess, q)
         except Exception as exc:  # noqa: BLE001
             sess.log.append(f"auto say failed: {type(exc).__name__}: {exc}")
+        if sess.turns >= LIVE_TURNS:
+            _await_speech_drained(sess)
+            sess.log.append(f"auto: 아바타 발화 {LIVE_TURNS}회를 마쳐 세션을 종료한다")
+            _live_end(sess)
+            return
+        # the candidate's turn: the rest of the cycle after the avatar's question
         for _ in range(int(LIVE_CYCLE_S * 2)):
             if not (sess.auto and sess.state in ("starting", "live")):
                 return
@@ -1075,7 +1114,7 @@ def config() -> dict:
         "voice": VOICE, "default_avatar": DEFAULT_AVATAR, "max_chars": MAX_CHARS, "mode": "once", "model": "lite",
         "gpu": fh.GPU, "scaledown_s": fh.SCALEDOWN_S, "app": fh.APP_NAME, "tail_s": VIDEO_TAIL_S,
         "audio_max_mb": AUDIO_MAX_BYTES // 1_000_000, "audio_max_seconds": AUDIO_MAX_SECONDS,
-        "live_max_sessions": LIVE_MAX_SESSIONS, "live_speak_s": LIVE_SPEAK_S, "live_cycle_s": LIVE_CYCLE_S,
+        "live_max_sessions": LIVE_MAX_SESSIONS, "live_speak_s": LIVE_SPEAK_S, "live_cycle_s": LIVE_CYCLE_S, "live_turns": LIVE_TURNS,
     }
 
 
@@ -1343,10 +1382,7 @@ def live_stop(sid: str) -> dict:
     sess = live_sessions.get(sid)
     if not sess:
         raise HTTPException(404, "no such session")
-    if sess.state in ("starting", "live"):
-        _put_async({"type": "end"}, f"{sid}:audio", f"end {sid[:6]}")
-        sess.state = "ending"
-        sess.log.append("stop requested")
+    _live_end(sess)
     return sess.public()
 
 
