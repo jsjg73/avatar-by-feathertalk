@@ -1,0 +1,60 @@
+{
+ "lite": {
+  "model_type": "lite",
+  "load_s": 15.0,
+  "prep_s": 23.6,
+  "chunk_s": [
+   0.876,
+   0.743,
+   0.786,
+   0.766,
+   0.772,
+   0.774,
+   0.772,
+   0.776,
+   0.778,
+   0.781,
+   0.767,
+   0.775,
+   0.766,
+   0.769,
+   0.769
+  ],
+  "encode_s": 2.0,
+  "frames": 369,
+  "chunks": 15,
+  "slice_len": 24,
+  "motion_frames": 9,
+  "speech_s": 13.85,
+  "peak_vram_gb": 5.5,
+  "total_s": 52.2
+ },
+ "pro": {
+  "model_type": "pro",
+  "load_s": 8.7,
+  "prep_s": 23.6,
+  "chunk_s": [
+   8.656,
+   8.515,
+   8.557,
+   8.572,
+   8.593,
+   8.61,
+   8.833,
+   8.62,
+   8.628,
+   8.649,
+   8.671,
+   8.666,
+   8.685
+  ],
+  "encode_s": 1.6,
+  "frames": 369,
+  "chunks": 13,
+  "slice_len": 28,
+  "motion_frames": 5,
+  "speech_s": 13.85,
+  "peak_vram_gb": 6.7,
+  "total_s": 146.1
+ }
+}

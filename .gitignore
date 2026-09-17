@@ -1,0 +1,40 @@
+# ── 상류 클론 (각자 .git을 가진 남의 저장소) ─────────────────────────────
+# 우리 변경분은 patches/ 에 따로 보관한다.
+/opentalking/
+/model-repos/
+
+# ── 모델 가중치 (수 GB, 허브/Modal Volume에서 받는다) ─────────────────────
+/models/
+
+# ── 런타임 산출물 ────────────────────────────────────────────────────────
+flashhead-modal/studio/jobs/
+flashhead-modal/studio/live/
+flashhead-modal/studio/studio.log
+flashhead-modal/studio/warm.json
+
+# 아바타 라이브러리는 UI 업로드로 채워지는 런타임 자산이다.
+# 기본 아바타 두 장만 추적해 새로 클론해도 바로 돌아가게 한다.
+flashhead-modal/studio/avatars/*
+!flashhead-modal/studio/avatars/newscaster.png
+!flashhead-modal/studio/avatars/woman.png
+flashhead-modal/bench/*.json
+/logs/
+/run/
+
+# 실험 결과 영상·프레임 (재생성 가능, 수치는 README에 남긴다)
+flashhead-modal/*.mp4
+flashhead-modal/ab/*.mp4
+flashhead-modal/ab/*.png
+flashhead-modal/ab/*.wav
+*.mkv
+
+# ── 파이썬·에디터·OS ─────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.DS_Store
+
+# flashhead-modal/inputs/ 와 동일한 파일들 (중복 방지). 스크립트·README만 추적.
+flashhead-runpod/inputs/

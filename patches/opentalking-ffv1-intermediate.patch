@@ -1,0 +1,64 @@
+diff --git a/opentalking/video_creation.py b/opentalking/video_creation.py
+index 263ac26..3fd6020 100644
+--- a/opentalking/video_creation.py
++++ b/opentalking/video_creation.py
+@@ -478,9 +478,13 @@ class _IncrementalVideoWriter:
+             height, width = arr.shape[:2]
+             self._size = (int(width), int(height))
+             self.path.parent.mkdir(parents=True, exist_ok=True)
++            # This file is only an intermediate that ffmpeg later muxes with the
++            # audio, so encode it losslessly and let the final encode decide
++            # quality.  mp4v offers no quality control and cost ~3.8 dB PSNR.
++            fourcc = "FFV1" if self.path.suffix.lower() == ".mkv" else "mp4v"
+             self._writer = cv2.VideoWriter(
+                 str(self.path),
+-                getattr(cv2, "VideoWriter_fourcc")(*"mp4v"),
++                getattr(cv2, "VideoWriter_fourcc")(*fourcc),
+                 self.fps,
+                 self._size,
+             )
+@@ -1228,6 +1232,8 @@ async def _ffmpeg_mux(ffmpeg_bin: str, video_in: Path, audio_in: Path, out_mp4:
+         str(audio_in),
+         "-c:v",
+         "libx264",
++        "-crf",
++        "18",
+         "-pix_fmt",
+         "yuv420p",
+         "-c:a",
+@@ -1640,7 +1646,7 @@ class VideoCreationService:
+             ),
+         )
+         fps = float(getattr(worker, 'fps', 25) or 25)
+-        video_only = work_dir / 'video_only.mp4'
++        video_only = work_dir / 'video_only.mkv'
+         if chunk_sink is None:
+             frames: list[np.ndarray] = []
+             for frame in worker.generate_frames_from_script(script):
+@@ -1824,7 +1830,7 @@ class VideoCreationService:
+         if light2d_renderer is not None:
+             try:
+                 _write_wav(audio_wav, pcm, sample_rate)
+-                video_only = work_dir / "video_only.mp4"
++                video_only = work_dir / "video_only.mkv"
+                 if chunk_sink is None:
+                     _write_light2d_video_only(
+                         video_only,
+@@ -1951,7 +1957,7 @@ class VideoCreationService:
+             preroll_frames = max(0, int(round(float(preroll_samples) * fps / float(sample_rate)))) if preroll_samples else 0
+             target_frames = max(1, int(round(float(pcm.size) * fps / float(sample_rate))))
+             if chunk_sink is not None:
+-                video_only = work_dir / "video_only.mp4"
++                video_only = work_dir / "video_only.mkv"
+                 archive_writer = _IncrementalVideoWriter(video_only, fps=fps)
+                 emitter = _VideoChunkEmitter(
+                     pcm=pcm,
+@@ -1983,7 +1989,7 @@ class VideoCreationService:
+         finally:
+             await client.close()
+ 
+-        video_only = work_dir / "video_only.mp4"
++        video_only = work_dir / "video_only.mkv"
+         if chunk_sink is None:
+             if preroll_samples:
+                 drop_frames = max(0, int(round(float(preroll_samples) * fps / float(sample_rate))))

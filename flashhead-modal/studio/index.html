@@ -1,0 +1,593 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FlashHead Studio</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --panel-2: #1e222b; --line: #2a2f3a;
+    --text: #e6e8ee; --muted: #8b93a7; --accent: #6ea8fe; --ok: #5ecf8a; --err: #ff7b7b;
+    --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.5 -apple-system, "Apple SD Gothic Neo", system-ui, sans-serif; }
+  header { padding: 22px 28px 12px; border-bottom: 1px solid var(--line); display: flex; align-items: baseline; gap: 14px; }
+  header h1 { margin: 0; font-size: 20px; font-weight: 650; letter-spacing: -0.01em; }
+  header .sub { color: var(--muted); font-size: 13px; }
+  .warm { margin-left: auto; display: flex; align-items: center; gap: 10px; font-size: 12.5px; color: var(--muted); }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--line); box-shadow: 0 0 0 2px var(--panel); }
+  .dot.on { background: var(--ok); } .dot.pending { background: var(--accent); animation: pulse 1.2s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: .35; } }
+  .switch { display: inline-flex; align-items: center; gap: 7px; cursor: pointer; user-select: none; }
+  .switch input { display: none; }
+  .switch i { width: 30px; height: 17px; border-radius: 999px; background: var(--line); position: relative; transition: background .2s; }
+  .switch i::after { content: ""; position: absolute; top: 2px; left: 2px; width: 13px; height: 13px; border-radius: 50%; background: var(--text); transition: left .2s; }
+  .switch input:checked + i { background: var(--ok); }
+  .switch input:checked + i::after { left: 15px; }
+  .switch input:disabled + i { opacity: .5; }
+  main { display: grid; grid-template-columns: minmax(320px, 440px) 1fr; gap: 24px; padding: 24px 28px; max-width: 1400px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px; }
+  label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 8px; }
+  textarea { width: 100%; min-height: 160px; resize: vertical; background: var(--panel-2); color: var(--text);
+             border: 1px solid var(--line); border-radius: 8px; padding: 12px; font: inherit; line-height: 1.6; }
+  textarea:focus { outline: none; border-color: var(--accent); }
+  .row { display: flex; justify-content: space-between; align-items: center; margin-top: 10px; gap: 12px; }
+  .avatars { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
+  .or-audio { display: flex; align-items: center; gap: 10px; margin-top: 10px; font-size: 12.5px; color: var(--muted); flex-wrap: wrap; }
+  .or-audio .hint { font-size: 12px; }
+  .badge-src { font-size: 11px; padding: 2px 7px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+  .avatar { width: 76px; cursor: pointer; text-align: center; border: 0; background: none; padding: 0; color: inherit; font: inherit; }
+  .avatar img, .avatar .add { width: 76px; height: 76px; border-radius: 10px; display: block; box-sizing: border-box; }
+  .avatar img { object-fit: cover; object-position: 50% 22%; border: 2px solid transparent; background: var(--panel-2); }
+  .avatar.selected img { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(110,168,254,.25); }
+  .avatar .add { border: 1px dashed var(--line); display: grid; place-items: center; color: var(--muted); font-size: 24px; line-height: 1; }
+  .avatar:hover .add { border-color: var(--accent); color: var(--accent); }
+  .avatar span { display: block; font-size: 11.5px; color: var(--muted); margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .avatar.selected span { color: var(--text); }
+  .avatar.busy { opacity: .5; pointer-events: none; }
+  .thumb { width: 28px; height: 28px; border-radius: 50%; object-fit: cover; object-position: 50% 22%; background: var(--panel-2); }
+  .who { font-size: 12.5px; color: var(--muted); }
+  .count { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+  button { background: var(--accent); color: #0b1020; border: 0; border-radius: 8px; padding: 10px 18px;
+           font: inherit; font-weight: 650; cursor: pointer; }
+  button:disabled { opacity: .45; cursor: default; }
+  .meta { margin-top: 16px; font-size: 12.5px; color: var(--muted); display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; }
+  .meta b { color: var(--text); font-weight: 550; }
+  .note { margin-top: 14px; font-size: 12.5px; color: var(--muted); border-top: 1px solid var(--line); padding-top: 12px; }
+
+  .jobs { display: flex; flex-direction: column; gap: 14px; }
+  .job { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px; }
+  .job-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .status { font-size: 12px; padding: 3px 9px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+  .status.render, .status.tts { color: var(--accent); border-color: var(--accent); }
+  .status.done { color: var(--ok); border-color: var(--ok); }
+  .live { font-size: 11px; font-weight: 700; letter-spacing: .04em; color: #ff8a8a; border: 1px solid #ff8a8a; border-radius: 999px; padding: 2px 8px; }
+  .live::before { content: ""; display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: #ff8a8a; margin-right: 5px; animation: pulse 1s ease-in-out infinite; }
+  .status.error { color: var(--err); border-color: var(--err); }
+  .elapsed { font-family: var(--mono); font-size: 12px; color: var(--muted); margin-left: auto; }
+  .text { margin: 10px 0 12px; white-space: pre-wrap; line-height: 1.6; }
+  .bar { height: 6px; background: var(--panel-2); border-radius: 999px; overflow: hidden; }
+  .bar > i { display: block; height: 100%; background: var(--accent); width: 0; transition: width .6s ease; }
+  .bar.indeterminate > i { width: 30%; animation: slide 1.4s ease-in-out infinite alternate; }
+  @keyframes slide { from { transform: translateX(-40%);} to { transform: translateX(300%);} }
+  .phase { font-size: 12.5px; color: var(--muted); margin-top: 6px; display: flex; justify-content: space-between; }
+  video { width: 100%; max-width: 512px; border-radius: 10px; margin-top: 12px; background: #000; display: block; }
+  details { margin-top: 10px; }
+  summary { cursor: pointer; font-size: 12.5px; color: var(--muted); }
+  pre.log { margin: 8px 0 0; padding: 10px 12px; background: #0b0d12; border: 1px solid var(--line); border-radius: 8px;
+            font: 11.5px/1.5 var(--mono); color: #b7c0d6; max-height: 260px; overflow: auto; white-space: pre-wrap; }
+  .empty { color: var(--muted); font-size: 14px; padding: 30px 0; text-align: center; }
+  .err { color: var(--err); font-size: 13px; margin-top: 8px; }
+  .path { display: flex; align-items: center; gap: 10px; margin-top: 8px; font-size: 12px; color: var(--muted); flex-wrap: wrap; }
+  .pro-slot { margin-top: 12px; border-top: 1px dashed var(--line); padding-top: 10px; }
+  .live-panel { margin-bottom: 14px; }
+  .live-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .live-head .elapsed { margin-left: 0; }
+  .live-head button { margin-left: auto; }
+  .live-head button + button { margin-left: 0; }
+  .live-status { font-size: 12.5px; color: var(--muted); }
+  .live-model { display: inline-flex; gap: 10px; font-size: 12px; color: var(--muted); }
+  .live-model label { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
+  .live-model input { accent-color: var(--accent); margin: 0; }
+  .live-body { margin-top: 12px; }
+  .live-video-slot video { margin-top: 0; }
+  .live-say { display: flex; gap: 8px; margin-top: 10px; }
+  .live-say input { flex: 1; background: var(--panel-2); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 9px 12px; font: inherit; }
+  .live-say input:focus { outline: none; border-color: var(--accent); }
+  .live-meta { margin-top: 8px; font-size: 12px; color: var(--muted); display: flex; gap: 14px; flex-wrap: wrap; }
+  .live-meta b { color: var(--text); font-weight: 550; }
+  .pro-head { display: flex; align-items: center; gap: 10px; font-size: 12.5px; color: var(--muted); flex-wrap: wrap; }
+  .tag { font-size: 11px; font-weight: 700; letter-spacing: .04em; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--accent); color: var(--accent); }
+  .pro-slot .bar { margin-top: 8px; }
+  .path code { font: 11.5px var(--mono); word-break: break-all; }
+  button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--line); padding: 4px 10px; font-size: 12px; font-weight: 550; }
+</style>
+</head>
+<body>
+<header>
+  <h1>FlashHead Studio</h1>
+  <span class="sub">멘트를 입력하면 뉴스 앵커 아바타가 말하는 영상을 만듭니다</span>
+  <div class="warm" id="warm">
+    <span class="dot" id="warmDot"></span>
+    <span id="warmText">GPU 상태 확인 중</span>
+    <label class="switch" title="켜두면 GPU 컨테이너 1대를 상주시킵니다 (약 $0.80/시간)">
+      <input type="checkbox" id="warmToggle"><i></i><span>예열 유지</span>
+    </label>
+  </div>
+</header>
+
+<main>
+  <section class="panel">
+    <label>아바타</label>
+    <div class="avatars" id="avatars"></div>
+    <input type="file" id="avatarFile" accept="image/png,image/jpeg,image/webp" hidden>
+    <label for="text">멘트</label>
+    <textarea id="text" placeholder="예) 안녕하세요. 오늘의 주요 소식을 전해드립니다."></textarea>
+    <div class="row">
+      <span class="count"><span id="count">0</span> / <span id="max">400</span></span>
+      <button id="go">영상 만들기</button>
+    </div>
+    <div class="or-audio">
+      <span>또는</span>
+      <button type="button" class="ghost" id="audioPick">음성 파일로 만들기</button>
+      <input type="file" id="audioFile" accept="audio/*,video/*" hidden>
+      <span class="hint" id="audioHint"></span>
+    </div>
+    <div class="err" id="formErr" hidden></div>
+    <div class="meta">
+      <span>아바타</span><b id="cfgImage">—</b>
+      <span>음성</span><b id="cfgVoice">—</b>
+      <span>모델</span><b id="cfgModel">—</b>
+      <span>오디오 인코딩</span><b id="cfgMode">—</b>
+    </div>
+    <div class="note">
+      GPU가 예열된 상태면 오디오 길이와 비슷한 시간에 완성됩니다(1초 분량 ≈ 청크 하나 ≈ 0.8초).
+      꺼진 상태에서는 컨테이너 시작과 모델 로딩에 약 70초가 먼저 들고, 마지막 작업 후 <span id="cfgScaledown">—</span>분이 지나면 자동으로 꺼집니다.
+      영상은 마지막 말 뒤에 0.5초 이상 무음 구간을 두고 끝납니다. 결과는 합성된 인물의 합성 음성입니다.
+    </div>
+  </section>
+
+  <section>
+    <div class="panel live-panel" id="livePanel">
+      <div class="live-head">
+        <b>라이브 세션</b>
+        <span class="live" id="liveBadge" hidden>LIVE</span>
+        <span class="live-model">
+          <label><input type="radio" name="liveModel" value="lite" checked> Lite · L4</label>
+          <label><input type="radio" name="liveModel" value="pro"> Pro · 2×H100 jp</label>
+        </span>
+        <span class="live-status" id="liveStatus">세션 없음 — 선택한 아바타로 시작합니다</span>
+        <span class="elapsed" id="liveClock"></span>
+        <button id="liveStart" class="ghost">세션 시작</button>
+        <button id="liveStop" class="ghost" hidden>세션 종료</button>
+      </div>
+      <div class="live-body" id="liveBody" hidden>
+        <div class="live-video-slot"></div>
+        <div class="live-say">
+          <input id="liveText" placeholder="말할 문장을 입력하고 Enter — 세션 준비 중에도 보낼 수 있고, 준비되는 즉시 말합니다" maxlength="1000">
+          <button id="liveSay">말하기</button>
+          <button type="button" class="ghost" id="liveAudioPick" title="음성 파일을 그대로 재생시킵니다">음성 파일</button>
+          <input type="file" id="liveAudioFile" accept="audio/*,video/*" hidden>
+        </div>
+        <div class="live-meta" id="liveMeta"></div>
+        <details><summary>라이브 로그</summary><pre class="log" id="liveLog"></pre></details>
+      </div>
+      <div class="err" id="liveErr" hidden></div>
+    </div>
+    <div class="jobs" id="jobs"><div class="empty">아직 만든 영상이 없습니다.</div></div>
+  </section>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.15/dist/hls.min.js"></script>
+<script>
+const $ = (s) => document.querySelector(s);
+const textEl = $('#text'), countEl = $('#count'), goBtn = $('#go'), jobsEl = $('#jobs'), errEl = $('#formErr');
+let MAX = 400, DEFAULT_AVATAR = 'newscaster', selectedAvatar = null;
+
+fetch('/api/config').then(r => r.json()).then(c => {
+  MAX = c.max_chars; $('#max').textContent = MAX;
+  audioHint.textContent = `mp3·wav·m4a 등 ${c.audio_max_mb} MB / ${Math.round(c.audio_max_seconds / 60)}분 이하`;
+  DEFAULT_AVATAR = c.default_avatar; $('#cfgVoice').textContent = c.voice;
+  loadAvatars();
+  $('#cfgModel').textContent = 'SoulX-FlashHead 1.3B ' + c.model + ' · ' + c.gpu; $('#cfgMode').textContent = c.mode;
+  $('#cfgScaledown').textContent = Math.round(c.scaledown_s / 60);
+}).catch(() => {});
+
+// --- warm toggle / container status ---------------------------------------
+const warmToggle = $('#warmToggle'), warmDot = $('#warmDot'), warmText = $('#warmText');
+function showWarm(w) {
+  warmToggle.checked = w.keep_warm;
+  const up = w.containers > 0, ready = !!w.ready;
+  warmDot.className = 'dot ' + (ready ? 'on' : (up || w.keep_warm ? 'pending' : ''));
+  if (w.error) warmText.textContent = 'GPU 상태 확인 실패';
+  else if (ready && w.keep_warm) warmText.textContent = 'GPU 준비됨 · 상주 중 (과금)';
+  else if (ready) warmText.textContent = 'GPU 준비됨 · 유휴 시 자동 종료';
+  else if (up) warmText.textContent = 'GPU 시작·모델 로딩 중…';
+  else if (w.keep_warm) warmText.textContent = 'GPU 시작 요청됨…';
+  else warmText.textContent = 'GPU 꺼짐 (과금 없음)';
+}
+async function refreshWarm() {
+  try { showWarm(await (await fetch('/api/warm')).json()); } catch {}
+  setTimeout(refreshWarm, 15000);
+}
+warmToggle.addEventListener('change', async () => {
+  warmToggle.disabled = true;
+  try {
+    const r = await fetch('/api/warm', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                        body: JSON.stringify({ on: warmToggle.checked }) });
+    if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+    showWarm(await r.json());
+  } catch (e) { alert('예열 설정 실패: ' + e.message); warmToggle.checked = !warmToggle.checked; }
+  warmToggle.disabled = false;
+});
+refreshWarm();
+
+// --- avatar library ----------------------------------------------------------
+const avatarsEl = $('#avatars'), avatarFile = $('#avatarFile');
+function selectAvatar(id) {
+  selectedAvatar = id;
+  try { localStorage.setItem('avatar', id); } catch {}
+  avatarsEl.querySelectorAll('.avatar').forEach(a => a.classList.toggle('selected', a.dataset.id === id));
+  $('#cfgImage').textContent = id;
+}
+async function loadAvatars() {
+  let list = [];
+  try { list = await (await fetch('/api/avatars')).json(); } catch { return; }
+  avatarsEl.innerHTML = '';
+  for (const a of list) {
+    const b = document.createElement('button'); b.type = 'button'; b.className = 'avatar'; b.dataset.id = a.id;
+    b.title = a.name;
+    const img = document.createElement('img'); img.src = a.url; img.alt = a.name;
+    const name = document.createElement('span'); name.textContent = a.name;
+    b.append(img, name);
+    b.addEventListener('click', () => selectAvatar(a.id));
+    avatarsEl.appendChild(b);
+  }
+  const add = document.createElement('button'); add.type = 'button'; add.className = 'avatar'; add.title = '이미지 추가';
+  add.innerHTML = '<div class="add">+</div><span>추가</span>';
+  add.addEventListener('click', () => avatarFile.click());
+  avatarsEl.appendChild(add);
+  let remembered = null; try { remembered = localStorage.getItem('avatar'); } catch {}
+  const ids = list.map(a => a.id);
+  selectAvatar(ids.includes(selectedAvatar) ? selectedAvatar : ids.includes(remembered) ? remembered : ids.includes(DEFAULT_AVATAR) ? DEFAULT_AVATAR : ids[0]);
+}
+avatarFile.addEventListener('change', async () => {
+  const f = avatarFile.files[0]; avatarFile.value = '';
+  if (!f) return;
+  errEl.hidden = true;
+  avatarsEl.classList.add('busy');
+  try {
+    const fd = new FormData(); fd.append('file', f, f.name);
+    const r = await fetch('/api/avatars', { method: 'POST', body: fd });
+    if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+    const a = await r.json();
+    selectedAvatar = a.id;
+    await loadAvatars();
+  } catch (e) {
+    errEl.textContent = '아바타 추가 실패: ' + e.message; errEl.hidden = false;
+  }
+  avatarsEl.classList.remove('busy');
+});
+
+textEl.addEventListener('input', () => {
+  countEl.textContent = textEl.value.length;
+  goBtn.disabled = textEl.value.trim().length === 0 || textEl.value.length > MAX;
+});
+goBtn.disabled = true;
+
+const audioPick = $('#audioPick'), audioFile = $('#audioFile'), audioHint = $('#audioHint');
+audioPick.addEventListener('click', () => audioFile.click());
+audioFile.addEventListener('change', async () => {
+  const f = audioFile.files[0]; audioFile.value = '';
+  if (!f) return;
+  errEl.hidden = true; audioPick.disabled = true; audioHint.textContent = `${f.name} 업로드 중…`;
+  try {
+    const fd = new FormData(); fd.append('file', f, f.name); fd.append('avatar', selectedAvatar);
+    const r = await fetch('/api/jobs/audio', { method: 'POST', body: fd });
+    if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+    audioHint.textContent = `${f.name} 접수됨`;
+    await refresh();
+  } catch (e) {
+    errEl.textContent = '음성 파일 업로드 실패: ' + e.message; errEl.hidden = false; audioHint.textContent = '';
+  }
+  audioPick.disabled = false;
+});
+
+goBtn.addEventListener('click', async () => {
+  errEl.hidden = true;
+  goBtn.disabled = true;
+  try {
+    const r = await fetch('/api/jobs', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                        body: JSON.stringify({ text: textEl.value, avatar: selectedAvatar }) });
+    if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+    textEl.value = ''; countEl.textContent = '0';
+    await refresh();
+  } catch (e) {
+    errEl.textContent = '요청 실패: ' + e.message; errEl.hidden = false;
+    goBtn.disabled = false;
+  }
+});
+
+const STATUS_KO = { queued: '대기', tts: '음성 합성', render: '영상 생성', done: '완료', error: '실패' };
+
+function fmt(s) { s = Math.round(s); return `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`; }
+
+function phaseText(j) {
+  if (j.status === 'queued') return '대기 중';
+  if (j.status === 'tts') return '맥OS 음성 합성 중';
+  if (j.status === 'render') {
+    if (j.hls_url) return `스트리밍 재생 중 · 생성 청크 ${j.chunks_done} / ${j.expected_chunks}`;
+    if (j.chunks_done > 0) return `영상 생성 중 — 청크 ${j.chunks_done} / ${j.expected_chunks}`;
+    return 'GPU 컨테이너 시작·모델 로딩 중';
+  }
+  if (j.status === 'done') return `완료 · 오디오 ${j.audio_seconds.toFixed(1)}초`;
+  return '실패';
+}
+
+function jobCard(j) {
+  const el = document.createElement('article');
+  el.className = 'job'; el.dataset.id = j.id;
+  el.innerHTML = `
+    <div class="job-head">${j.avatar_url ? `<img class="thumb" src="${j.avatar_url}" alt="">` : ''}<span class="who">${escapeHtml(j.avatar || '')}</span><span class="status"></span><span class="live" hidden>LIVE</span><span class="elapsed"></span></div>
+    <div class="text">${j.source === 'upload' ? '<span class="badge-src">음성 파일</span> ' : ''}${escapeHtml(j.text)}</div>
+    <div class="progress"><div class="bar"><i></i></div><div class="phase"><span class="phase-text"></span><span class="pct"></span></div></div>
+    <div class="err" hidden></div>
+    <div class="video-slot"></div>
+    <div class="pro-slot" hidden></div>
+    <details><summary></summary><pre class="log"></pre></details>`;
+  return el;
+}
+
+function updateCard(el, j) {
+  const q = (s) => el.querySelector(s);
+  q('.status').className = 'status ' + j.status;
+  q('.status').textContent = STATUS_KO[j.status] || j.status;
+  q('.elapsed').textContent = j.started ? fmt(j.elapsed) : '';
+
+  const pct = j.expected_chunks ? Math.min(100, Math.round(100 * j.chunks_done / j.expected_chunks)) : 0;
+  const indeterminate = (j.status === 'render' && j.chunks_done === 0) || j.status === 'tts';
+  q('.progress').hidden = j.status === 'error';
+  q('.bar').className = 'bar' + (indeterminate ? ' indeterminate' : '');
+  q('.bar > i').style.width = indeterminate ? '' : (j.status === 'done' ? 100 : pct) + '%';
+  q('.phase-text').textContent = phaseText(j);
+  q('.pct').textContent = j.status === 'render' && j.chunks_done ? pct + '%' : '';
+
+  q('.err').hidden = j.status !== 'error';
+  q('.err').textContent = j.error || '';
+
+  // The video element is created exactly once so playback survives polling.
+  // While rendering it plays the growing HLS playlist (segments arrive per
+  // chunk); a finished job restored from disk gets the plain mp4.
+  q('.live').hidden = !(j.status === 'render' && j.hls_url);
+  const src = j.hls_url && j.status !== 'done' ? j.hls_url : (j.video_url || (j.hls_url || null));
+  if (src && !q('video')) {
+    const slot = q('.video-slot');
+    const v = document.createElement('video');
+    v.controls = true; v.playsInline = true;
+    if (src.endsWith('.m3u8')) attachHls(v, src, j.status !== 'done'); else v.src = src;
+    slot.appendChild(v);
+  }
+  if (j.video_path && !q('.path')) {
+    const row = document.createElement('div'); row.className = 'path';
+    const code = document.createElement('code'); code.textContent = j.video_path;
+    const btn = document.createElement('button'); btn.type = 'button'; btn.className = 'ghost'; btn.textContent = 'Finder에서 보기';
+    btn.addEventListener('click', () => fetch(`/api/jobs/${j.id}/reveal`, { method: 'POST' }).catch(() => {}));
+    row.append(code, btn); q('.video-slot').appendChild(row);
+  }
+
+  updatePro(el, j);
+
+  const details = q('details'), pre = q('pre.log');
+  q('summary').textContent = `로그 (${j.log.length}줄)`;
+  const text = j.log.join('\n');
+  if (pre.textContent !== text) {
+    pre.textContent = text;
+    if (details.open) pre.scrollTop = pre.scrollHeight;
+  }
+}
+
+const PRO_KO = { queued: '대기', render: '렌더 중', done: '완료', error: '실패' };
+
+function updatePro(el, j) {
+  const slot = el.querySelector('.pro-slot');
+  slot.hidden = j.status !== 'done';
+  if (slot.hidden) return;
+  const eta = Math.max(1, Math.round((j.pro_eta_s || 0) / 60));
+  const st = j.pro_status || '';
+  // idle / error: offer the button
+  if (!st || st === 'error') {
+    if (!slot.querySelector('button.pro-start')) {
+      slot.innerHTML = '';
+      const head = document.createElement('div'); head.className = 'pro-head';
+      const b = document.createElement('button'); b.type = 'button'; b.className = 'ghost pro-start';
+      b.textContent = `Pro 최종 렌더 (약 ${eta}분)`;
+      b.title = 'Wan VAE 기반 Pro 모델로 같은 음성·아바타·시드를 다시 렌더합니다. 화질이 크게 좋아지지만 오디오 길이의 약 8배가 걸립니다.';
+      b.addEventListener('click', async () => {
+        b.disabled = true;
+        try {
+          const r = await fetch(`/api/jobs/${j.id}/pro`, { method: 'POST' });
+          if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+          await refreshOnce();
+        } catch (e) { alert('Pro 렌더 요청 실패: ' + e.message); b.disabled = false; }
+      });
+      const note = document.createElement('span'); note.className = 'pro-note';
+      head.append(b, note); slot.appendChild(head);
+    }
+    slot.querySelector('.pro-note').textContent = st === 'error' ? ('이전 시도 실패: ' + (j.pro_error || '')) : 'Lite 미리보기와 같은 음성으로 고화질 완성본을 만듭니다';
+    return;
+  }
+  // queued / render: progress
+  if (st === 'queued' || st === 'render') {
+    if (!slot.querySelector('.pro-progress')) {
+      slot.innerHTML = `<div class="pro-head"><span class="tag">PRO</span><span class="pro-progress"></span><span class="elapsed pro-elapsed"></span></div>
+        <div class="bar"><i></i></div>`;
+    }
+    const pct = j.pro_expected_chunks ? Math.min(100, Math.round(100 * j.pro_chunks_done / j.pro_expected_chunks)) : 0;
+    slot.querySelector('.pro-progress').textContent = st === 'queued' ? 'Pro 렌더 대기 중'
+      : (j.pro_chunks_done ? `Pro 렌더 중 — 청크 ${j.pro_chunks_done} / ${j.pro_expected_chunks} (${pct}%)` : 'Pro 컨테이너 시작·모델 로딩 중');
+    slot.querySelector('.pro-elapsed').textContent = j.pro_started ? fmt(j.pro_elapsed) : '';
+    const bar = slot.querySelector('.bar'); bar.className = 'bar' + (j.pro_chunks_done ? '' : ' indeterminate');
+    bar.querySelector('i').style.width = j.pro_chunks_done ? pct + '%' : '';
+    return;
+  }
+  // done: second video, created once
+  if (st === 'done' && !slot.querySelector('video')) {
+    slot.innerHTML = `<div class="pro-head"><span class="tag">PRO</span><span>고화질 최종본 · ${fmt(j.pro_elapsed)} 소요</span></div>`;
+    const v = document.createElement('video'); v.controls = true; v.playsInline = true; v.src = j.pro_video_url;
+    slot.appendChild(v);
+    if (j.pro_video_path) {
+      const row = document.createElement('div'); row.className = 'path';
+      const code = document.createElement('code'); code.textContent = j.pro_video_path;
+      const btn = document.createElement('button'); btn.type = 'button'; btn.className = 'ghost'; btn.textContent = 'Finder에서 보기';
+      btn.addEventListener('click', () => fetch(`/api/jobs/${j.id}/reveal?which=pro`, { method: 'POST' }).catch(() => {}));
+      row.append(code, btn); slot.appendChild(row);
+    }
+  }
+}
+
+// --- live session --------------------------------------------------------------
+const LIVE = { id: null, video: null, timer: null };
+const liveEls = { start: $('#liveStart'), stop: $('#liveStop'), body: $('#liveBody'), status: $('#liveStatus'), badge: $('#liveBadge'),
+                  clock: $('#liveClock'), text: $('#liveText'), say: $('#liveSay'), meta: $('#liveMeta'), log: $('#liveLog'), err: $('#liveErr'),
+                  slot: document.querySelector('.live-video-slot') };
+
+function liveError(msg) { liveEls.err.textContent = msg; liveEls.err.hidden = false; }
+
+liveEls.start.addEventListener('click', async () => {
+  liveEls.err.hidden = true; liveEls.start.disabled = true;
+  try {
+    const model = (document.querySelector('input[name="liveModel"]:checked') || {}).value || 'lite';
+    const r = await fetch('/api/live', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ avatar: selectedAvatar, model }) });
+    if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+    const s = await r.json();
+    LIVE.id = s.id; LIVE.video = null; liveEls.slot.innerHTML = ''; liveEls.body.hidden = false; liveEls.stop.hidden = false; liveEls.start.hidden = true;
+    liveEls.text.focus();
+    pollLive();
+  } catch (e) { liveError('세션 시작 실패: ' + e.message); liveEls.start.disabled = false; }
+});
+
+liveEls.stop.addEventListener('click', async () => {
+  if (!LIVE.id) return;
+  liveEls.stop.disabled = true;
+  try { await fetch(`/api/live/${LIVE.id}/stop`, { method: 'POST' }); } catch {}
+});
+
+async function liveSay() {
+  const text = liveEls.text.value.trim();
+  if (!LIVE.id || !text) return;
+  liveEls.say.disabled = true;
+  try {
+    const r = await fetch(`/api/live/${LIVE.id}/say`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) });
+    if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+    liveEls.text.value = '';
+  } catch (e) { liveError('말하기 실패: ' + e.message); }
+  liveEls.say.disabled = false; liveEls.text.focus();
+}
+liveEls.say.addEventListener('click', liveSay);
+const liveAudioPick = $('#liveAudioPick'), liveAudioFile = $('#liveAudioFile');
+liveAudioPick.addEventListener('click', () => liveAudioFile.click());
+liveAudioFile.addEventListener('change', async () => {
+  const f = liveAudioFile.files[0]; liveAudioFile.value = '';
+  if (!f || !LIVE.id) return;
+  liveAudioPick.disabled = true;
+  try {
+    const fd = new FormData(); fd.append('file', f, f.name);
+    const r = await fetch(`/api/live/${LIVE.id}/say_audio`, { method: 'POST', body: fd });
+    if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+  } catch (e) { liveError('음성 파일 전송 실패: ' + e.message); }
+  liveAudioPick.disabled = false;
+});
+liveEls.text.addEventListener('keydown', (e) => { if (e.key === 'Enter') liveSay(); });
+
+function attachLive(v, url) {
+  // stay close to the live edge: ~1.5 chunks behind, catch up if we drift past 4
+  if (window.Hls && Hls.isSupported()) {
+    const h = new Hls({ liveSyncDuration: 1.5, liveMaxLatencyDuration: 4, maxBufferLength: 10, lowLatencyMode: false });
+    h.loadSource(url); h.attachMedia(v);
+    h.on(Hls.Events.MANIFEST_PARSED, () => v.play().catch(() => {}));
+    v.__hls = h;
+  } else { v.src = url; v.addEventListener('loadedmetadata', () => v.play().catch(() => {}), { once: true }); }
+}
+
+const LIVE_STATE_KO = { starting: 'GPU 준비·첫 세그먼트 대기 중', live: '라이브', ending: '종료 중', ended: '종료됨', error: '오류' };
+const LIVE_MODEL_KO = { lite: 'Lite · L4', pro: 'Pro · 2×H100 jp' };
+
+async function pollLive() {
+  if (!LIVE.id) return;
+  let s;
+  try { s = await (await fetch('/api/live/' + LIVE.id)).json(); } catch { LIVE.timer = setTimeout(pollLive, 2000); return; }
+  liveEls.status.textContent = (LIVE_MODEL_KO[s.model] || s.model) + ' — ' + (LIVE_STATE_KO[s.state] || s.state) +
+    (s.state === 'starting' && s.model === 'pro' ? ' (콜드면 2×H100 기동 + Pro 로딩 2–3분)' : '');
+  liveEls.badge.hidden = s.state !== 'live';
+  liveEls.clock.textContent = s.live_for ? fmt(s.live_for) : (s.elapsed ? fmt(s.elapsed) : '');
+  if (s.hls_url && !LIVE.video) {
+    const v = document.createElement('video'); v.controls = true; v.playsInline = true; v.autoplay = true;
+    liveEls.slot.appendChild(v); attachLive(v, s.hls_url); LIVE.video = v;
+  }
+  const edge = LIVE.video && LIVE.video.buffered.length ? (LIVE.video.buffered.end(LIVE.video.buffered.length - 1) - LIVE.video.currentTime).toFixed(1) : '-';
+  liveEls.meta.innerHTML = `<span>생성 청크 <b>${s.chunks}</b> (말한 청크 ${s.speech_chunks})</span><span>청크 생성 <b>${s.gen_s.toFixed(2)}s</b> / ${s.model === 'pro' ? '1.12' : '0.96'}s</span>` +
+    `<span>스케줄 지연 <b>${s.behind_s.toFixed(2)}s</b></span><span>대기 중 음성 <b>${s.queued_s.toFixed(1)}s</b></span><span>플레이어 버퍼 <b>${edge}s</b></span>` +
+    (s.recording_url ? `<span><a href="${s.recording_url}" style="color:var(--accent)">녹화 mp4</a></span>` : '');
+  liveEls.log.textContent = s.log.join('\n');
+  if (s.state === 'ended' || s.state === 'error') {
+    if (s.error) liveError(s.error);
+    liveEls.stop.hidden = true; liveEls.stop.disabled = false; liveEls.start.hidden = false; liveEls.start.disabled = false;
+    liveEls.status.textContent = (LIVE_STATE_KO[s.state] || s.state) + (s.recording_url ? ' · 녹화 저장됨' : '');
+    LIVE.id = null;
+    return;
+  }
+  LIVE.timer = setTimeout(pollLive, 1000);
+}
+
+async function refreshOnce() {
+  try { render(await (await fetch('/api/jobs')).json()); } catch {}
+}
+
+function attachHls(v, url, live) {
+  // start from the beginning and let the live edge run ahead (generation is
+  // faster than realtime); hls.js keeps reloading the EVENT playlist until ENDLIST
+  if (window.Hls && Hls.isSupported()) {
+    const h = new Hls({ startPosition: 0, liveDurationInfinity: false, maxBufferLength: 60 });
+    h.loadSource(url); h.attachMedia(v);
+    h.on(Hls.Events.MANIFEST_PARSED, () => { if (live) v.play().catch(() => {}); });
+    v.__hls = h;
+  } else if (v.canPlayType('application/vnd.apple.mpegurl')) {
+    v.src = url;
+    v.addEventListener('loadedmetadata', () => { if (v.currentTime > 1) v.currentTime = 0; if (live) v.play().catch(() => {}); }, { once: true });
+  } else {
+    v.src = url;
+  }
+}
+
+function render(list) {
+  const empty = jobsEl.querySelector('.empty');
+  if (!list.length) { if (!empty) jobsEl.innerHTML = '<div class="empty">아직 만든 영상이 없습니다.</div>'; return; }
+  if (empty) empty.remove();
+  // list is newest-first; existing cards are already in that order, so only
+  // new cards are inserted (oldest new first, each at the top) — never moved.
+  for (const j of [...list].reverse()) {
+    let el = jobsEl.querySelector(`article[data-id="${j.id}"]`);
+    if (!el) { el = jobCard(j); jobsEl.prepend(el); }
+    updateCard(el, j);
+  }
+}
+
+function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+async function refresh() {
+  try {
+    const list = await (await fetch('/api/jobs')).json();
+    render(list);
+    const busy = list.some(j => ['queued','tts','render'].includes(j.status) || ['queued','render'].includes(j.pro_status));
+    goBtn.disabled = textEl.value.trim().length === 0;
+    setTimeout(refresh, busy ? 2000 : 6000);
+  } catch { setTimeout(refresh, 4000); }
+}
+refresh();
+</script>
+</body>
+</html>
