@@ -38,3 +38,7 @@ venv/
 
 # flashhead-modal/inputs/ 와 동일한 파일들 (중복 방지). 스크립트·README만 추적.
 flashhead-runpod/inputs/
+
+# 로그
+*.log
+*.pid
