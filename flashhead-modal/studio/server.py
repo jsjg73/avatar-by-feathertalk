@@ -433,6 +433,51 @@ INTERVIEW_QUESTIONS = [
 ]
 
 
+# A playground is one demo run: the sessions you opened together, their
+# recordings and their Gantt. Starting a new one clears the screen without
+# throwing anything away — old runs stay loadable.
+PLAYGROUNDS_FILE = LIVE_DIR / "playgrounds.json"
+
+
+@dataclass
+class Playground:
+    id: str
+    name: str
+    created: float
+
+    def public(self) -> dict:
+        mine = [s for s in live_sessions.values() if s.playground == self.id]
+        chunks = sum(s.chunks for s in mine)
+        speech = sum(s.speech_chunks for s in mine)
+        spans = [sp for s in mine for sp in s.spans]
+        return {**asdict(self), "sessions": len(mine),
+                "active": sum(1 for s in mine if s.state in ("starting", "live")),
+                "video_s": round(chunks * SLICE_LEN / FPS, 1),
+                "gpu_s": round(speech * SLICE_LEN / FPS, 1),
+                "span_s": round(max((b for _, b in spans), default=0) - min((a for a, _ in spans), default=0), 1)}
+
+
+playgrounds: dict[str, Playground] = {}
+current_playground = ""
+
+
+def _save_playgrounds() -> None:
+    PLAYGROUNDS_FILE.write_text(json.dumps(
+        {"current": current_playground,
+         "items": [{"id": p.id, "name": p.name, "created": p.created} for p in playgrounds.values()]},
+        ensure_ascii=False, indent=1))
+
+
+def _new_playground(name: str = "") -> Playground:
+    global current_playground
+    p = Playground(id=uuid.uuid4().hex[:8],
+                   name=name or time.strftime("%m/%d %H:%M 시연"), created=time.time())
+    playgrounds[p.id] = p
+    current_playground = p.id
+    _save_playgrounds()
+    return p
+
+
 @dataclass
 class LiveSession:
     id: str
@@ -455,6 +500,7 @@ class LiveSession:
     # the grid is drawn straight from these
     spans: list = field(default_factory=list)
     container_t0: float = 0.0       # epoch of the container's own t=0 for this session
+    playground: str = ""            # which demo run this session belongs to
     started_live: float = 0.0
     finished: float = 0.0
     recording_url: str = ""
@@ -1021,6 +1067,10 @@ class LiveAuto(BaseModel):
     on: bool
 
 
+class PlaygroundNew(BaseModel):
+    name: str = ""
+
+
 @app.post("/api/live")
 def live_start(body: LiveCreate) -> JSONResponse:
     if body.avatar not in _avatars():
@@ -1031,7 +1081,7 @@ def live_start(body: LiveCreate) -> JSONResponse:
     if len(active) >= LIVE_MAX_SESSIONS:
         raise HTTPException(409, f"동시 세션은 {LIVE_MAX_SESSIONS}개까지입니다 (컨테이너 1대 기준)")
     sess = LiveSession(id=uuid.uuid4().hex[:10], avatar=body.avatar, created=time.time(),
-                       model=body.model, auto=body.auto)
+                       model=body.model, auto=body.auto, playground=current_playground)
     live_sessions[sess.id] = sess
     sess.log.append(f"session created (auto={body.auto})")
     threading.Thread(target=_live_consumer, args=(sess,), daemon=True, name=f"live-{sess.id}").start()
@@ -1041,8 +1091,41 @@ def live_start(body: LiveCreate) -> JSONResponse:
 
 
 @app.get("/api/live")
-def live_list() -> list[dict]:
-    return [s.public() for s in sorted(live_sessions.values(), key=lambda s: s.created, reverse=True)]
+def live_list(playground: str = "") -> list[dict]:
+    """Sessions of one demo run — the current one unless another is asked for."""
+    pg = playground or current_playground
+    return [s.public() for s in sorted(live_sessions.values(), key=lambda s: s.created, reverse=True)
+            if s.playground == pg]
+
+
+@app.get("/api/playgrounds")
+def playground_list() -> dict:
+    items = sorted((p.public() for p in playgrounds.values()), key=lambda p: p["created"], reverse=True)
+    return {"current": current_playground, "items": items}
+
+
+@app.post("/api/playgrounds")
+def playground_new(body: PlaygroundNew) -> dict:
+    """Start a fresh run: the screen empties, nothing is deleted."""
+    mine = [s for s in live_sessions.values() if s.playground == current_playground]
+    if any(s.state in ("starting", "live") for s in mine):
+        raise HTTPException(409, "진행 중인 세션이 있습니다. 먼저 종료해 주세요")
+    if not mine and current_playground in playgrounds and not body.name.strip():
+        return playgrounds[current_playground].public()      # already empty: no need for another
+    return _new_playground(body.name.strip()).public()
+
+
+@app.post("/api/playgrounds/{pid}/select")
+def playground_select(pid: str) -> dict:
+    """Load an earlier run. New sessions then join it too."""
+    global current_playground
+    if pid not in playgrounds:
+        raise HTTPException(404, "no such playground")
+    if any(s.state in ("starting", "live") for s in live_sessions.values() if s.playground == current_playground):
+        raise HTTPException(409, "진행 중인 세션이 있습니다. 먼저 종료해 주세요")
+    current_playground = pid
+    _save_playgrounds()
+    return playgrounds[pid].public()
 
 
 @app.get("/api/live/{sid}")
@@ -1221,6 +1304,15 @@ def video(job_id: str) -> FileResponse:
     return FileResponse(p, media_type="video/mp4")
 
 
+# playgrounds first: sessions restored below are filed under theirs
+try:
+    _saved = json.loads(PLAYGROUNDS_FILE.read_text())
+    for it in _saved.get("items", []):
+        playgrounds[it["id"]] = Playground(id=it["id"], name=it["name"], created=it["created"])
+    current_playground = _saved.get("current", "")
+except Exception:  # noqa: BLE001
+    pass
+
 # reload finished live sessions too: the demo screen keeps their recording and
 # their Gantt row, so a server restart must not erase the history
 for meta in LIVE_DIR.glob("*/session.json"):
@@ -1237,11 +1329,24 @@ for meta in LIVE_DIR.glob("*/session.json"):
         s.started_live = d.get("started_live", 0); s.finished = d.get("finished", 0)
         s.spans = [list(x) for x in d.get("spans", [])]
         s.said = d.get("said", [])
+        s.playground = d.get("playground", "")
         s.recording_url = d.get("recording_url", "") if (s.dir / "video.mp4").exists() else ""
         s.log.extend(d.get("log", [])[-30:])
         live_sessions[s.id] = s
     except Exception:  # noqa: BLE001
         continue
+
+# sessions from before playgrounds existed keep their history under one heading
+_orphans = [s for s in live_sessions.values() if not s.playground]
+if _orphans:
+    _legacy = Playground(id="legacy00", name="이전 기록", created=min(s.created for s in _orphans))
+    playgrounds.setdefault(_legacy.id, _legacy)
+    for s in _orphans:
+        s.playground = _legacy.id
+if current_playground not in playgrounds:
+    _new_playground()
+else:
+    _save_playgrounds()
 
 
 # reload finished jobs from disk so a server restart keeps the gallery

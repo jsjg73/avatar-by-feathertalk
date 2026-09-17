@@ -21,7 +21,8 @@
   header .right { margin-left: auto; display: flex; align-items: center; gap: 10px; }
   a { color: var(--accent); text-decoration: none; }
   select, button { font: inherit; }
-  select { background: var(--panel-2); color: var(--text); border: 1px solid var(--line); border-radius: 7px; padding: 5px 9px; font-size: 12.5px; }
+  select { background: var(--panel-2); color: var(--text); border: 1px solid var(--line); border-radius: 7px; padding: 5px 9px; font-size: 12.5px; max-width: 340px; }
+  #pgNew { padding: 5px 11px; font-size: 12.5px; }
   button { background: var(--accent); color: #0b1020; border: 0; border-radius: 7px; padding: 6px 14px; font-weight: 650; cursor: pointer; }
   button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--line); font-weight: 550; }
   button:disabled { opacity: .45; cursor: default; }
@@ -69,6 +70,8 @@
 <body>
 <header>
   <h1>동시 세션 시연</h1>
+  <select id="pg" title="플레이그라운드 — 시연 한 판"></select>
+  <button id="pgNew" class="ghost">새 플레이그라운드</button>
   <span class="sub" id="rhythm"></span>
   <div class="right">
     <span class="model">
@@ -103,6 +106,7 @@ let zoomRecent = false;      // false = 시연 전체, true = 최근 120초
 let MAX = 8, SPEAK = 7, CYCLE = 42;
 const players = new Map();
 let latest = [];
+let pgCurrent = '';          // the run being shown; sessions you add join it
 
 function showErr(m) { errEl.textContent = m; errEl.hidden = false; setTimeout(() => errEl.hidden = true, 6000); }
 function fmt(s) { s = Math.round(s); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; }
@@ -116,6 +120,43 @@ fetch('/api/config').then(r => r.json()).then(c => {
 fetch('/api/avatars').then(r => r.json()).then(list => {
   $('#avatar').innerHTML = list.map(a => `<option value="${a.id}">${esc(a.name)}</option>`).join('');
 }).catch(() => {});
+
+async function loadPlaygrounds() {
+  let data;
+  try { data = await (await fetch('/api/playgrounds')).json(); } catch { return; }
+  pgCurrent = data.current;
+  $('#pg').innerHTML = data.items.map(p => {
+    const bits = [`${p.sessions}세션`];
+    if (p.span_s) bits.push(fmt(p.span_s));
+    if (p.gpu_s) bits.push(`GPU ${fmt(p.gpu_s)}`);
+    if (p.active) bits.push(`진행 ${p.active}`);
+    return `<option value="${p.id}"${p.id === pgCurrent ? ' selected' : ''}>${esc(p.name)} · ${bits.join(' · ')}</option>`;
+  }).join('');
+}
+
+function resetScreen() {
+  players.clear();
+  latest = [];
+  grid.querySelectorAll('article.cell').forEach(el => el.remove());
+  gantt.innerHTML = '';
+}
+
+$('#pg').addEventListener('change', async (e) => {
+  try {
+    const r = await fetch(`/api/playgrounds/${e.target.value}/select`, { method: 'POST' });
+    if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+  } catch (err) { showErr('불러오기 실패: ' + err.message); await loadPlaygrounds(); return; }
+  resetScreen(); await loadPlaygrounds(); poll();
+});
+
+$('#pgNew').addEventListener('click', async () => {
+  try {
+    const r = await fetch('/api/playgrounds', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                               body: JSON.stringify({}) });
+    if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+  } catch (err) { showErr('새 플레이그라운드 실패: ' + err.message); return; }
+  resetScreen(); await loadPlaygrounds(); poll();
+});
 
 async function addSession() {
   const model = document.querySelector('input[name="model"]:checked').value;
@@ -243,7 +284,8 @@ function drawGantt(list) {
 }
 
 async function poll() {
-  try { latest = await (await fetch('/api/live')).json(); } catch { setTimeout(poll, 2000); return; }
+  try { latest = await (await fetch('/api/live?playground=' + encodeURIComponent(pgCurrent))).json(); }
+  catch { setTimeout(poll, 2000); return; }
   // ended sessions stay on screen with their recording, and keep their Gantt row
   const shown = [...latest].sort((a, b) => a.created - b.created);
   let add = grid.querySelector('.add');
@@ -268,9 +310,11 @@ async function poll() {
     ? `${active.length}/${MAX} 세션 · 영상 ${(ch * 0.96 / 60).toFixed(1)}분 · GPU ${(sp * 0.96 / 60).toFixed(1)}분 (${ch ? Math.round(sp / ch * 100) : 0}%)`
     : '세션 없음';
   drawGantt(shown);
+  poll._n = (poll._n || 0) + 1;
+  if (poll._n % 5 === 1) loadPlaygrounds();          // keep the dropdown's figures fresh
   setTimeout(poll, active.length ? 1000 : 3000);
 }
-poll();
+loadPlaygrounds().then(poll);
 setInterval(() => drawGantt([...latest].sort((a, b) => a.created - b.created)), 500);
 </script>
 </body>
