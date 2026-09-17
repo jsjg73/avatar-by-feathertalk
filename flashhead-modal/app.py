@@ -255,6 +255,7 @@ class Renderer:
         self.slot_t0 = None
         self.slot = 0
         # NOTE: gen_ema is seeded by the warm-up above; do not reset it here
+        self.slot_overruns = 0             # slots where ongoing utterances exceeded the budget
         ready_key = f"ready:{self.model_type}"
 
         def beat() -> None:
@@ -614,6 +615,9 @@ class Renderer:
             "speaking": False, "loop_pos": 0, "last_frame": None, "want_since": None,
             "ended": False, "open": True, "done": threading.Event(), "reason": "",
             "last_speech": time.time(), "k": 0,
+            # the overrun counter is container-wide, so a session reports the
+            # slots that overran while it was open, not the container's lifetime total
+            "overruns_at_open": self.slot_overruns,
             "stats": {"chunks": 0, "speech_chunks": 0, "gpu_chunks": 0, "deferred_chunks": 0,
                       "gen_s": [], "behind_s": [], "wait_to_speak_s": []},
         })
@@ -716,10 +720,20 @@ class Renderer:
             # a session mid-utterance keeps its turn; otherwise the longest wait wins
             ongoing = [s for s in speakers if s["speaking"]]
             waiting = sorted((s for s in speakers if not s["speaking"]), key=lambda s: s["want_since"])
+            # A session mid-utterance is never cut: once speech is being played
+            # out there is no slack in its audio timeline, so a missed slot shows
+            # up as a second of silence in the middle of a sentence. Slicing the
+            # combined list would have done exactly that whenever the budget
+            # shrank below the number of speakers already talking (possible on any
+            # GPU fast enough for a budget above 1). Overrunning the slot instead
+            # is recoverable — idle chunks are free, so the lag is worked off.
             # compare by id: a session dict holds tensors, so `in` would try to
             # compare those element-wise and raise
-            chosen = {s["id"] for s in (ongoing + waiting)[:budget]}
+            chosen = {s["id"] for s in ongoing}
+            chosen |= {s["id"] for s in waiting[:max(0, budget - len(ongoing))]}
             chosen |= {s["id"] for s in live if s["idle_loop"] is None}   # no loop to fall back on
+            if len(ongoing) > budget:
+                self.slot_overruns += 1
 
             for s in live:
                 try:
@@ -819,7 +833,7 @@ class Renderer:
                "behind_tail_s": max(tail) if tail else None,
                "wait_to_speak_max_s": max(waits) if waits else 0.0,
                "wait_to_speak_median_s": sorted(waits)[len(waits) // 2] if waits else 0.0,
-               "ended_by": sess["reason"], "ffmpeg_rc": rc,
+               "ended_by": sess["reason"], "ffmpeg_rc": rc, "slot_overruns": self.slot_overruns - sess["overruns_at_open"],
                "peer_sessions": len(self.live_sessions) - 1,
                "seconds": round(time.time() - sess["t0"], 1)}
         try:
