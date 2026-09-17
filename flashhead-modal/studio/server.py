@@ -505,6 +505,10 @@ class LiveSession:
     finished: float = 0.0
     recording_url: str = ""
     log: deque = field(default_factory=lambda: deque(maxlen=200))
+    # the container's end-of-session stats, kept whole: this is the run's
+    # record (gen_median_s, behind_*, slot_overruns, …) and the only place
+    # the numbers survive once the container is gone
+    stats: dict = field(default_factory=dict)
 
     @property
     def dir(self) -> Path:
@@ -628,7 +632,8 @@ def _live_consumer(sess: LiveSession) -> None:
                 pass
         for it in fh.progress.get_many(100, block=False, partition=sess.id):
             handle(it)
-        sess.log.append(f"container stats: {json.dumps(stats)[:200]}")
+        sess.stats = stats
+        sess.log.append("container stats: " + ", ".join(f"{k}={v}" for k, v in stats.items()))
         # keep a recording of the whole session
         if sess.segments:
             out = sess.dir / "video.mp4"
