@@ -16,8 +16,11 @@ L4 bills ~$0.80/hr, so the default is scale-to-zero after `SCALEDOWN_S`.
 """
 
 import json
+import os
 import pathlib
+import threading
 import time
+from collections import deque
 
 import modal
 
@@ -157,15 +160,24 @@ def _emit(job_id: str, line: str) -> None:
         pass
 
 
+# One container, many sessions. The GPU can only draw for one session at a time
+# (a chunk takes 0.82 s of its 0.96 s slot on an L4), but sessions mostly *listen*
+# — and a listening avatar plays a pre-rendered loop, costing nothing. So N
+# sessions share one GPU as long as they rarely speak at the same moment; when
+# they do, the loser keeps playing its loop and its speech starts a beat later.
+LIVE_MAX_SESSIONS = 8
+
+
 @app.cls(
     image=image,
     gpu=GPU,
     volumes={WEIGHTS: weights, CACHE: cache},
     scaledown_window=SCALEDOWN_S,
     min_containers=0,
-    max_containers=1,   # the studio serialises jobs; never let a queue fan out to N GPUs
+    max_containers=1,   # one GPU; sessions share it rather than fanning out
     timeout=3600,
 )
+@modal.concurrent(max_inputs=LIVE_MAX_SESSIONS)
 class Renderer:
     # "lite" (default) or "pro". Each value gets its own container pool and its
     # own autoscaler settings, so Renderer(model_type="pro") never competes with
@@ -224,6 +236,20 @@ class Renderer:
         # The flag carries a heartbeat: a deploy replaces this container and the
         # exit hook is not guaranteed to run, so readers treat a flag whose beat
         # is older than ~60 s as stale instead of trusting its mere presence.
+        # every GPU op goes through this: `generate()` and `reset_person_name()`
+        # write pipeline instance state, so concurrent sessions must take turns
+        self.gpu_lock = threading.Lock()
+        self.avatars: dict = {}            # sha -> registered in the pipeline
+        self.sessions: dict = {}           # session_id -> per-session pipeline state
+        self.loop_locks: dict = {}         # one idle loop per avatar, rendered once
+        self.loop_locks_guard = threading.Lock()
+        self.idle_loops: dict = {}         # avatar -> decoded loop frames, shared by sessions
+        self.live_sessions: dict = {}      # session_id -> everything the scheduler needs
+        self.sched_thread = None           # the one thread that produces live video
+        self.sched_guard = threading.Lock()
+        self.slot_t0 = None
+        self.slot = 0
+        self.gen_ema = 0.0                 # measured chunk time; sets the per-slot GPU budget
         ready_key = f"ready:{self.model_type}"
 
         def beat() -> None:
@@ -241,6 +267,87 @@ class Renderer:
     def unload(self) -> None:
         state.pop(f"ready:{self.model_type}", None)
         print("container exiting; ready flag cleared", flush=True)
+
+    def _ensure_avatar(self, image_bytes: bytes, use_face_crop: bool = True) -> str:
+        """Register one avatar in the pipeline without disturbing the others.
+
+        `prepare_params` REPLACES cond_image_dict, so calling it per session would
+        wipe every other session's reference. This repeats just its per-avatar body
+        — the pipeline keeps a dict of them precisely so `reset_person_name` can
+        switch between avatars at zero cost."""
+        import hashlib
+        import tempfile
+
+        from flash_head.src.pipeline.flash_head_pipeline import get_cond_image_dict
+        from flash_head.utils.utils import resize_and_centercrop
+
+        name = "av" + hashlib.sha256(image_bytes).hexdigest()[:12]
+        with self.gpu_lock:
+            if name in self.avatars:
+                return name
+            d = pathlib.Path(tempfile.mkdtemp(prefix="av-"))
+            path = d / f"{name}.png"
+            path.write_bytes(image_bytes)
+            pil = get_cond_image_dict(str(path), use_face_crop)[name]
+            pl = self.pipeline
+            t = resize_and_centercrop(pil, (pl.target_h, pl.target_w)).to(pl.device, dtype=pl.param_dtype)
+            t = (t / 255 - 0.5) * 2
+            pl.cond_image_dict[name] = pil
+            pl.cond_image_tensor_dict[name] = t
+            pl.ref_img_latent_dict[name] = pl.vae.encode(t.repeat(1, 1, pl.frame_num, 1, 1))
+            self.avatars[name] = True
+            path.unlink()
+            d.rmdir()
+            return name
+
+    def _gpu_free(self) -> bool:
+        """Is the GPU idle right now? Used to decide whether an utterance may start;
+        best-effort, since another session can take it a moment later."""
+        if self.gpu_lock.acquire(blocking=False):
+            self.gpu_lock.release()
+            return True
+        return False
+
+    def _run_chunk(self, sess: dict, emb, drop_motion: bool = True):
+        """Generate one chunk for `sess`, swapping its pipeline state in and out
+        under the lock. The audio encoder is read-only, so its work stays outside.
+        Returns (frames uint8, generate seconds, seconds spent waiting for the GPU)."""
+        import numpy as np
+
+        from flash_head.inference import run_pipeline
+
+        w0 = time.time()
+        with self.gpu_lock:
+            t0 = time.time()
+            pl = self.pipeline
+            pl.reset_person_name(sess["avatar"])          # also resets latent_motion_frames
+            if sess.get("motion") is not None:
+                pl.latent_motion_frames = sess["motion"]
+            pl.generator = sess["generator"]
+            video = run_pipeline(pl, emb)
+            sess["motion"] = pl.latent_motion_frames
+            if drop_motion:
+                video = video[pl.motion_frames_num:]
+            frames = video.cpu().numpy().astype(np.uint8)
+        return frames, time.time() - t0, t0 - w0
+
+    def _chunk(self, sess: dict, audio_window, start_idx: int, end_idx: int):
+        """`_run_chunk` for the streaming path: build the rolling-window embedding first."""
+        import numpy as np
+
+        from flash_head.inference import get_audio_embedding
+
+        emb = get_audio_embedding(self.pipeline, np.array(audio_window, dtype=np.float32), start_idx, end_idx)
+        return self._run_chunk(sess, emb)
+
+    def _session(self, image_bytes: bytes, seed: int, use_face_crop: bool, session_id: str) -> dict:
+        """Register the avatar and open a per-call pipeline-state slot."""
+        import torch
+
+        sess = {"avatar": self._ensure_avatar(image_bytes, use_face_crop), "motion": None,
+                "generator": torch.Generator(device=self.pipeline.device).manual_seed(seed)}
+        self.sessions[session_id] = sess
+        return sess
 
     @modal.method()
     def ping(self) -> dict:
@@ -305,7 +412,7 @@ class Renderer:
         threading.Thread(target=heartbeat, daemon=True).start()
         try:
             _emit(job_id, f"[{time.time()-t0:5.1f}s] preparing reference (face crop, seed {seed})")
-            get_base_data(self.pipeline, cond_image_path_or_dir=str(img), base_seed=seed, use_face_crop=use_face_crop)
+            sess = self._session(image_bytes, seed, use_face_crop, job_id)
             _emit(job_id, f"[{time.time()-t0:5.1f}s] reference ready")
             p = get_infer_params()
             sr, fps = p["sample_rate"], p["tgt_fps"]
@@ -342,14 +449,9 @@ class Renderer:
 
             frames = []
             for i, chunk in enumerate(chunks):
-                torch.cuda.synchronize()
-                c0 = time.time()
-                video = run_pipeline(self.pipeline, chunk)
-                if i != 0:
-                    video = video[motion_frames_num:]
-                torch.cuda.synchronize()
-                frames.append(video.cpu())
-                _emit(job_id, f"[{time.time()-t0:5.1f}s] chunk {i+1}/{n_chunks} done ({time.time()-c0:.2f}s)")
+                block, gen_s, _ = self._run_chunk(sess, chunk, drop_motion=i != 0)
+                frames.append(torch.from_numpy(block))
+                _emit(job_id, f"[{time.time()-t0:5.1f}s] chunk {i+1}/{n_chunks} done ({gen_s:.2f}s)")
 
             _emit(job_id, f"[{time.time()-t0:5.1f}s] encoding mp4")
             tmp = work / "video_noaudio.mp4"
@@ -368,6 +470,7 @@ class Renderer:
             return out.read_bytes()
         finally:
             stop.set()
+            self.sessions.pop(job_id, None)
             try:
                 for f in work.iterdir():
                     f.unlink()
@@ -389,37 +492,87 @@ class Renderer:
         use_idle_loop: bool = True,
         fade_frames: int = 4,
     ) -> dict:
-        """A live session: upstream *stream* mode paced to the wall clock.
+        """Join a live session. The container's single scheduler drives it.
 
-        Every 0.96 s (one chunk) the loop takes the next 0.96 s of speech from
-        the Queue partition `<session_id>:audio` — or a silent chunk if nothing
-        is queued, which keeps the avatar idling — runs wav2vec2 over the 8 s
-        rolling window and generates 24 new frames, then ships HLS segments to
-        partition `<session_id>` like render_stream. Ends on an {"type": "end"}
-        item, after `idle_timeout_s` without speech, or at `max_seconds`.
+        Sessions do not pace themselves. An earlier version gave each session its
+        own clock and had them compete for the GPU lock, which behaves exactly as
+        uncoordinated greedy actors do: a session that fell behind generated flat
+        out, starved its peers, and pushed them behind too. Here one scheduler
+        thread produces exactly one chunk per session per 0.96 s slot and decides
+        who gets the GPU, so no session can be delayed by another's backlog.
 
-        With `use_idle_loop` the silent chunks are not generated at all: a loop
-        rendered once per avatar (cached in the weights Volume) plays instead, so
-        the GPU only works while the avatar speaks. Both hand-offs were measured
-        (`spike_seam`, `spike_return`): entering generation from the loop is free
-        — the loop's last 9 frames go into `latent_motion_frames`, which is what
-        the model conditions on anyway — while returning needs a short cross-fade,
-        since a hard cut jumps 6.25 MAD against a natural frame step of 2.7 and a
-        4-frame fade brings it to 1.66.
-
-        Latency budget on a warm L4 (Lite): audio put→get ≈0.7 s, wait for the
-        next chunk slot ≤0.96 s, generate 0.8 s, segment closes with the next
-        chunk ≈0.96 s, ship ≈0.7 s, player 1–2 s behind the live edge.
+        While an avatar listens it plays a pre-rendered idle loop, which costs
+        nothing; only speech needs the GPU. The GPU fits one generation per slot
+        on an L4 (0.82 s of 0.96 s), so when several avatars want to talk at once
+        the others' *speech* waits a slot or two while their *video* keeps running
+        at realtime. That is the capacity limit made explicit rather than emergent.
         """
-        import os
+        sess = self._open_live(session_id, image_bytes, seed, use_face_crop, use_idle_loop,
+                               fade_frames, idle_timeout_s, max_seconds)
+        try:
+            threading.Thread(target=self._ingest, args=(sess,), daemon=True,
+                             name=f"ingest-{session_id}").start()
+            self._ensure_scheduler()
+            sess["done"].wait(timeout=max_seconds + 300)
+            return self._close_live(sess)
+        finally:
+            self.live_sessions.pop(session_id, None)
+            self.sessions.pop(session_id, None)
+
+    # ---- live session plumbing (all driven by _scheduler_loop) ----------------
+    def _idle_loop_for(self, image_bytes: bytes, seed: int, sess: dict, p: dict) -> "object":
+        """The idle loop for this avatar: rendered once, then shared by every
+        session using it. Concurrent starts would otherwise each render the same
+        9 s of video — three at once cost 24 s of GPU and put all three behind."""
+        import imageio
+        import numpy as np
+
+        name = sess["avatar"]
+        cached_loop = self.idle_loops.get(name)
+        if cached_loop is not None:
+            return cached_loop
+        with self.loop_locks_guard:
+            lock = self.loop_locks.setdefault(name, threading.Lock())
+        with lock:
+            if name in self.idle_loops:
+                return self.idle_loops[name]
+            path = _idle_loop_path(image_bytes, seed, self.model_type)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if not path.exists():
+                t0 = time.time()
+                sr, fps = p["sample_rate"], p["tgt_fps"]
+                slice_len = p["frame_num"] - p["motion_frames_num"]
+                dq = deque([0.0] * (p["cached_audio_duration"] * sr), maxlen=p["cached_audio_duration"] * sr)
+                end_idx = p["cached_audio_duration"] * fps
+                made = []
+                for _ in range(IDLE_CHUNKS):
+                    dq.extend(np.zeros(slice_len * sr // fps, dtype=np.float32).tolist())
+                    made.append(self._chunk(sess, dq, end_idx - p["frame_num"], end_idx)[0])
+                sess["motion"] = None          # the loop is a shared asset, not this session's history
+                tmp = path.with_name(f".{path.stem}.{os.getpid()}.tmp.mp4")
+                with imageio.get_writer(str(tmp), format="mp4", mode="I", fps=fps, codec="h264",
+                                        ffmpeg_params=["-bf", "0", "-crf", "20", "-preset", "veryfast",
+                                                       "-pix_fmt", "yuv420p"]) as w:
+                    for block in made:
+                        for f in block:
+                            w.append_data(f)
+                tmp.replace(path)
+                weights.commit()
+                print(f"idle loop rendered in {time.time()-t0:.0f}s -> {path.name}", flush=True)
+            reader = imageio.get_reader(str(path))
+            loop = np.stack([np.asarray(f) for f in reader])
+            reader.close()
+            self.idle_loops[name] = loop
+            return loop
+
+    def _open_live(self, session_id: str, image_bytes: bytes, seed: int, use_face_crop: bool,
+                   use_idle_loop: bool, fade_frames: int, idle_timeout_s: float, max_seconds: float) -> dict:
+        import queue as _q
         import tempfile
-        import threading
-        from collections import deque
 
         import numpy as np
-        import torch
 
-        from flash_head.inference import get_audio_embedding, get_base_data, get_infer_params, run_pipeline
+        from flash_head.inference import get_infer_params
 
         t0 = time.time()
         work = pathlib.Path(tempfile.mkdtemp(prefix=f"live-{session_id}-"))
@@ -427,182 +580,238 @@ class Renderer:
         hls.mkdir()
         (work / "ref.png").write_bytes(image_bytes)
         ship = _HlsShipper(session_id, hls, t0)
-        audio_part = f"{session_id}:audio"
-        proc = None
-        stats = {"chunks": 0, "speech_chunks": 0, "gpu_chunks": 0, "gen_s": [], "behind_s": [], "ended_by": ""}
-        try:
-            ship.log(f"live: preparing reference (face crop, seed {seed})")
-            get_base_data(self.pipeline, cond_image_path_or_dir=str(work / "ref.png"), base_seed=seed, use_face_crop=use_face_crop)
-            p = get_infer_params()
-            sr, fps = p["sample_rate"], p["tgt_fps"]
-            frame_num, motion = p["frame_num"], p["motion_frames_num"]
-            slice_len = frame_num - motion
-            chunk_samples = slice_len * sr // fps                 # 15360 = 0.96 s
-            chunk_s = slice_len / fps
-            cached = p["cached_audio_duration"] * sr              # 8 s rolling window
-            audio_end_idx = p["cached_audio_duration"] * fps
-            audio_start_idx = audio_end_idx - frame_num
-            audio_dq: deque = deque([0.0] * cached, maxlen=cached)
+        ship.log(f"live: preparing reference (face crop, seed {seed})")
 
-            fifo = str(work / "audio.pipe")
-            os.mkfifo(fifo)
-            proc = _live_ffmpeg(hls, p["width"], p["height"], fps, sr, fifo, slice_len)
-            # two writers: ffmpeg interleaves by timestamp, so each stream needs
-            # its own feeder or the muxer deadlocks waiting on the other pipe
-            import queue as _q
+        sess = self._session(image_bytes, seed, use_face_crop, session_id)
+        p = get_infer_params()
+        sr, fps = p["sample_rate"], p["tgt_fps"]
+        frame_num, motion = p["frame_num"], p["motion_frames_num"]
+        slice_len = frame_num - motion
+        cached = p["cached_audio_duration"] * sr
+        sess.update({
+            "id": session_id, "ship": ship, "work": work, "hls": hls, "t0": t0,
+            "sr": sr, "fps": fps, "motion": sess.get("motion"), "motion_n": motion,
+            "slice_len": slice_len, "chunk_samples": slice_len * sr // fps, "chunk_s": slice_len / fps,
+            "audio_end_idx": p["cached_audio_duration"] * fps,
+            "audio_start_idx": p["cached_audio_duration"] * fps - frame_num,
+            "audio_dq": deque([0.0] * cached, maxlen=cached),
+            "pending": deque(), "buf": np.zeros(0, dtype=np.float32),
+            "fade_frames": fade_frames, "idle_timeout_s": idle_timeout_s, "max_seconds": max_seconds,
+            "speaking": False, "loop_pos": 0, "last_frame": None, "want_since": None,
+            "ended": False, "open": True, "done": threading.Event(), "reason": "",
+            "last_speech": time.time(), "k": 0,
+            "stats": {"chunks": 0, "speech_chunks": 0, "gpu_chunks": 0, "deferred_chunks": 0,
+                      "gen_s": [], "behind_s": [], "wait_to_speak_s": []},
+        })
+        sess["idle_loop"] = self._idle_loop_for(image_bytes, seed, sess, p) if use_idle_loop else None
 
-            vq: _q.Queue = _q.Queue()
-            aq: _q.Queue = _q.Queue()
+        fifo = str(work / "audio.pipe")
+        os.mkfifo(fifo)
+        proc = _live_ffmpeg(hls, p["width"], p["height"], fps, sr, fifo, slice_len)
+        vq: _q.Queue = _q.Queue()
+        aq: _q.Queue = _q.Queue()
 
-            def vwriter() -> None:
-                assert proc is not None and proc.stdin is not None
-                try:
-                    while (arr := vq.get()) is not None:
-                        proc.stdin.write(arr.tobytes())
-                finally:
-                    proc.stdin.close()
-
-            def awriter() -> None:
-                with open(fifo, "wb") as f:              # blocks until ffmpeg opens the reader
-                    while (pcm := aq.get()) is not None:
-                        f.write(pcm)
-
-            threading.Thread(target=vwriter, daemon=True).start()
-            threading.Thread(target=awriter, daemon=True).start()
-
-            pending: deque = deque()                      # float32 arrays of chunk_samples
-            buf = np.zeros(0, dtype=np.float32)            # sentence PCM not yet cut into chunks
-            ended = False
-            last_speech = time.time()
-            stream_t0 = None
-            k = 0
-            # ---- idle loop: rendered once per avatar, then reused by every session
-            idle_loop = None
-            if use_idle_loop:
-                import imageio
-
-                loop_path = _idle_loop_path(image_bytes, seed, self.model_type)
-                loop_path.parent.mkdir(parents=True, exist_ok=True)
-                if not loop_path.exists():
-                    t_loop = time.time()
-                    dq: deque = deque([0.0] * cached, maxlen=cached)
-                    made = []
-                    for _ in range(IDLE_CHUNKS):
-                        dq.extend(np.zeros(chunk_samples, dtype=np.float32).tolist())
-                        e = get_audio_embedding(self.pipeline, np.array(dq, dtype=np.float32), audio_start_idx, audio_end_idx)
-                        made.append(run_pipeline(self.pipeline, e)[motion:].cpu().numpy().astype(np.uint8))
-                    tmp_loop = loop_path.with_name(f".{loop_path.stem}.{os.getpid()}.tmp.mp4")
-                    with imageio.get_writer(str(tmp_loop), format="mp4", mode="I", fps=fps, codec="h264",
-                                            ffmpeg_params=["-bf", "0", "-crf", "20", "-preset", "veryfast", "-pix_fmt", "yuv420p"]) as w:
-                        for block in made:
-                            for f in block:
-                                w.append_data(f)
-                    tmp_loop.replace(loop_path)
-                    weights.commit()
-                    ship.log(f"live: idle loop rendered in {time.time()-t_loop:.0f}s → {loop_path.name}")
-                reader = imageio.get_reader(str(loop_path))
-                idle_loop = np.stack([np.asarray(f) for f in reader])
-                reader.close()
-                ship.log(f"live: idle loop ready ({len(idle_loop)} frames) — GPU rests while the avatar listens")
-            loop_pos = 0
-            speaking = False
-            last_frame = None
-
-            ship.log(f"live: ready — {chunk_s:.2f}s chunks, idle timeout {idle_timeout_s:.0f}s")
-            while True:
-                # ingest speech / control items
-                for item in progress.get_many(50, block=False, partition=audio_part):
-                    if not isinstance(item, dict):
-                        continue
-                    if item.get("type") == "end":
-                        ended = True
-                    elif item.get("type") == "audio":
-                        raws = item.get("chunks") or [item.get("pcm", b"")]
-                        arr = np.concatenate([np.frombuffer(r, dtype=np.int16).astype(np.float32) / 32768.0 for r in raws]) if raws else np.zeros(0, np.float32)
-                        buf = np.concatenate([buf, arr])
-                        while len(buf) >= chunk_samples:
-                            pending.append(buf[:chunk_samples]); buf = buf[chunk_samples:]
-                        if item.get("final", True) and len(buf):   # pad the sentence tail instead of waiting for more speech
-                            pending.append(np.concatenate([buf, np.zeros(chunk_samples - len(buf), dtype=np.float32)])); buf = buf[:0]
-                now = time.time()
-                if ended and not pending:
-                    stats["ended_by"] = "stop"; break
-                if not pending and now - last_speech > idle_timeout_s:
-                    stats["ended_by"] = "idle"; break
-                if now - t0 > max_seconds:
-                    stats["ended_by"] = "max_seconds"; break
-                # pace to the wall clock, staying `lead_chunks` ahead of playback time
-                if stream_t0 is None:
-                    stream_t0 = now
-                sched = stream_t0 + (k - lead_chunks) * chunk_s
-                if now < sched:
-                    time.sleep(min(sched - now, 0.25))
-                    continue                              # re-check the queue while waiting
-                behind = now - sched
-                if pending:
-                    pcm = pending.popleft(); is_speech = True; last_speech = now
-                else:
-                    pcm = np.zeros(chunk_samples, dtype=np.float32); is_speech = False
-                g0 = time.time()
-                audio_dq.extend(pcm.tolist())          # the 8 s window advances either way
-                if idle_loop is not None and not is_speech:
-                    frames = np.take(idle_loop, range(loop_pos, loop_pos + slice_len), axis=0, mode="wrap")
-                    loop_pos = (loop_pos + slice_len) % len(idle_loop)
-                    if speaking:                       # first silent chunk after a turn: fade back into the loop
-                        frames = frames.copy()
-                        wts = np.linspace(0, 1, fade_frames + 2)[1:-1].reshape(-1, 1, 1, 1)
-                        frames[:fade_frames] = (last_frame.astype(np.float32) * (1 - wts)
-                                                + frames[:fade_frames].astype(np.float32) * wts).astype(np.uint8)
-                        speaking = False
-                    gen = 0.0
-                else:
-                    if idle_loop is not None and not speaking:
-                        # entering generation: continue from the frames the viewer is seeing
-                        seen = np.take(idle_loop, range(loop_pos - motion, loop_pos), axis=0, mode="wrap")
-                        t = torch.from_numpy(np.ascontiguousarray(seen)).to(self.pipeline.device, dtype=self.pipeline.param_dtype)
-                        self.pipeline.latent_motion_frames = self.pipeline.vae.encode(((t / 255 - 0.5) * 2).permute(3, 0, 1, 2).unsqueeze(0))
-                        speaking = True
-                    emb = get_audio_embedding(self.pipeline, np.array(audio_dq, dtype=np.float32), audio_start_idx, audio_end_idx)
-                    frames = run_pipeline(self.pipeline, emb)[motion:].cpu().numpy().astype(np.uint8)
-                    gen = time.time() - g0
-                vq.put(frames)
-                last_frame = frames[-1]
-                aq.put((np.clip(pcm, -1.0, 1.0) * 32767).astype(np.int16).tobytes())
-                k += 1
-                stats["chunks"] = k; stats["speech_chunks"] += int(is_speech)
-                stats["gpu_chunks"] += int(gen > 0)
-                if gen > 0:
-                    stats["gen_s"].append(round(gen, 3))
-                stats["behind_s"].append(round(behind, 2))
-                ship.ship_new_files()
-                if is_speech or k % 10 == 0 or k <= 3:
-                    ship.log(f"live: chunk {k} {'speech' if is_speech else 'silence'} gen {gen:.2f}s behind {behind:.2f}s queued {len(pending)*chunk_s:.1f}s")
-            # finalize
-            vq.put(None); aq.put(None)
-            rc = proc.wait(timeout=120)
-            ship.ship_new_files()
-            saved = 100 * (1 - stats["gpu_chunks"] / k) if k else 0
-            ship.log(f"{DONE_MARK} live ended ({stats['ended_by']}): {k} chunks, {stats['speech_chunks']} speech, "
-                     f"GPU {stats['gpu_chunks']} chunks ({saved:.0f}% saved), {ship.streamed/1e6:.1f} MB")
-            ship.close()
-            stats["gen_median_s"] = sorted(stats["gen_s"])[len(stats["gen_s"]) // 2] if stats["gen_s"] else None
-            stats["gpu_chunk_ratio"] = round(stats["gpu_chunks"] / k, 3) if k else None
-            stats["behind_max_s"] = max(stats["behind_s"]) if stats["behind_s"] else None
-            stats["ffmpeg_rc"] = rc
-            stats.pop("gen_s"); stats.pop("behind_s")
-            return stats
-        finally:
-            if proc is not None and proc.poll() is None:
-                proc.kill()
-            if ship.thread.is_alive():
-                ship.q.put(None)
+        def vwriter() -> None:
             try:
-                for f in sorted(work.rglob("*"), reverse=True):
-                    f.unlink() if f.is_file() else f.rmdir()
-                work.rmdir()
-            except OSError:
-                pass
+                while (arr := vq.get()) is not None:
+                    proc.stdin.write(arr.tobytes())
+            finally:
+                proc.stdin.close()
 
+        def awriter() -> None:
+            with open(fifo, "wb") as f:               # blocks until ffmpeg opens the reader
+                while (pcm := aq.get()) is not None:
+                    f.write(pcm)
+
+        threading.Thread(target=vwriter, daemon=True).start()
+        threading.Thread(target=awriter, daemon=True).start()
+        sess.update({"proc": proc, "vq": vq, "aq": aq})
+        if sess["idle_loop"] is not None:
+            ship.log(f"live: idle loop ready ({len(sess['idle_loop'])} frames) — GPU rests while the avatar listens")
+        ship.log(f"live: ready — {sess['chunk_s']:.2f}s chunks, idle timeout {idle_timeout_s:.0f}s")
+        self.live_sessions[session_id] = sess
+        return sess
+
+    def _ingest(self, sess: dict) -> None:
+        """Audio arrives on the session's Queue partition. Network I/O, so it runs
+        off the scheduler: the scheduler must never block on a remote read."""
+        import numpy as np
+
+        n = sess["chunk_samples"]
+        while sess["open"]:
+            try:
+                items = progress.get_many(50, block=True, timeout=1, partition=f"{sess['id']}:audio")
+            except Exception:  # noqa: BLE001  (queue.Empty and transient errors alike)
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "end":
+                    sess["ended"] = True
+                elif item.get("type") == "audio":
+                    raws = item.get("chunks") or [item.get("pcm", b"")]
+                    arr = np.concatenate([np.frombuffer(r, dtype=np.int16).astype(np.float32) / 32768.0
+                                          for r in raws]) if raws else np.zeros(0, np.float32)
+                    buf = np.concatenate([sess["buf"], arr])
+                    while len(buf) >= n:
+                        sess["pending"].append(buf[:n]); buf = buf[n:]
+                    if item.get("final", True) and len(buf):
+                        sess["pending"].append(np.concatenate([buf, np.zeros(n - len(buf), dtype=np.float32)]))
+                        buf = buf[:0]
+                    sess["buf"] = buf
+
+    def _ensure_scheduler(self) -> None:
+        with self.sched_guard:
+            if self.sched_thread is None or not self.sched_thread.is_alive():
+                self.sched_thread = threading.Thread(target=self._scheduler_loop, daemon=True,
+                                                     name="live-scheduler")
+                self.sched_thread.start()
+
+    def _scheduler_loop(self) -> None:
+        """One chunk per session per slot, forever. The only place GPU work is
+        scheduled, so the budget below is the whole capacity story."""
+        import numpy as np
+
+        while True:
+            live = [s for s in list(self.live_sessions.values()) if s["open"]]
+            if not live:
+                self.slot_t0 = None
+                time.sleep(0.05)
+                continue
+            chunk_s = live[0]["chunk_s"]
+            if self.slot_t0 is None:
+                self.slot_t0, self.slot = time.time(), 0
+            target = self.slot_t0 + self.slot * chunk_s
+            now = time.time()
+            if now < target:
+                time.sleep(min(target - now, chunk_s))
+                continue
+            behind = now - target
+            self.slot += 1
+
+            # how many generations fit in a slot, from the generation time we measure
+            budget = max(1, int(chunk_s / max(0.05, self.gen_ema)))
+            speakers = [s for s in live if s["pending"]]
+            for s in speakers:
+                if s["want_since"] is None:
+                    s["want_since"] = now
+            # a session mid-utterance keeps its turn; otherwise the longest wait wins
+            ongoing = [s for s in speakers if s["speaking"]]
+            waiting = sorted((s for s in speakers if not s["speaking"]), key=lambda s: s["want_since"])
+            # compare by id: a session dict holds tensors, so `in` would try to
+            # compare those element-wise and raise
+            chosen = {s["id"] for s in (ongoing + waiting)[:budget]}
+            chosen |= {s["id"] for s in live if s["idle_loop"] is None}   # no loop to fall back on
+
+            for s in live:
+                try:
+                    self._produce(s, s["id"] in chosen, behind, now)
+                except Exception as exc:  # noqa: BLE001 — one bad session must not stop the rest
+                    s["reason"] = f"error: {type(exc).__name__}: {exc}"[:200]
+                    s["open"] = False
+                    s["done"].set()
+
+    def _produce(self, sess: dict, may_speak: bool, behind: float, now: float) -> None:
+        """Emit exactly one chunk for one session."""
+        import numpy as np
+
+        st = sess["stats"]
+        n = sess["chunk_samples"]
+        if sess["ended"] and not sess["pending"]:
+            sess["reason"] = "stop"; sess["open"] = False; sess["done"].set(); return
+        if not sess["pending"] and now - sess["last_speech"] > sess["idle_timeout_s"]:
+            sess["reason"] = "idle"; sess["open"] = False; sess["done"].set(); return
+        if now - sess["t0"] > sess["max_seconds"]:
+            sess["reason"] = "max_seconds"; sess["open"] = False; sess["done"].set(); return
+
+        is_speech = bool(sess["pending"]) and may_speak
+        if is_speech:
+            pcm = sess["pending"].popleft()
+            sess["last_speech"] = now
+            if sess["want_since"] is not None:
+                st["wait_to_speak_s"].append(round(now - sess["want_since"], 2))
+                sess["want_since"] = None
+        else:
+            pcm = np.zeros(n, dtype=np.float32)
+            if sess["pending"]:
+                st["deferred_chunks"] += 1
+        sess["audio_dq"].extend(pcm.tolist())       # the 8 s window advances either way
+
+        loop = sess["idle_loop"]
+        if loop is not None and not is_speech:
+            frames = np.take(loop, range(sess["loop_pos"], sess["loop_pos"] + sess["slice_len"]),
+                             axis=0, mode="wrap")
+            sess["loop_pos"] = (sess["loop_pos"] + sess["slice_len"]) % len(loop)
+            if sess["speaking"]:                    # returning from a turn: fade into the loop
+                f = sess["fade_frames"]
+                frames = frames.copy()
+                w = np.linspace(0, 1, f + 2)[1:-1].reshape(-1, 1, 1, 1)
+                frames[:f] = (sess["last_frame"].astype(np.float32) * (1 - w)
+                              + frames[:f].astype(np.float32) * w).astype(np.uint8)
+                sess["speaking"] = False
+            gen = 0.0
+        else:
+            if loop is not None and not sess["speaking"]:
+                # entering generation: continue from the frames the viewer is seeing
+                seen = np.take(loop, range(sess["loop_pos"] - sess["motion_n"], sess["loop_pos"]),
+                               axis=0, mode="wrap")
+                import torch
+
+                with self.gpu_lock:
+                    t = torch.from_numpy(np.ascontiguousarray(seen)).to(self.pipeline.device,
+                                                                        dtype=self.pipeline.param_dtype)
+                    sess["motion"] = self.pipeline.vae.encode(((t / 255 - 0.5) * 2).permute(3, 0, 1, 2).unsqueeze(0))
+                sess["speaking"] = True
+            frames, gen, _ = self._chunk(sess, sess["audio_dq"], sess["audio_start_idx"], sess["audio_end_idx"])
+            self.gen_ema = 0.9 * self.gen_ema + 0.1 * gen if self.gen_ema else gen
+            st["gen_s"].append(round(gen, 3))
+
+        sess["vq"].put(frames)
+        sess["last_frame"] = frames[-1]
+        sess["aq"].put((np.clip(pcm, -1.0, 1.0) * 32767).astype(np.int16).tobytes())
+        sess["k"] += 1
+        st["chunks"] = sess["k"]
+        st["speech_chunks"] += int(is_speech)
+        st["gpu_chunks"] += int(gen > 0)
+        st["behind_s"].append(round(behind, 2))
+        sess["ship"].ship_new_files()
+        if is_speech or sess["k"] % 20 == 0:
+            sess["ship"].log(f"live: chunk {sess['k']} {'speech' if is_speech else 'silence'} "
+                             f"gen {gen:.2f}s behind {behind:.2f}s queued {len(sess['pending'])*sess['chunk_s']:.1f}s")
+
+    def _close_live(self, sess: dict) -> dict:
+        sess["open"] = False
+        sess["vq"].put(None)
+        sess["aq"].put(None)
+        rc = sess["proc"].wait(timeout=120)
+        ship = sess["ship"]
+        ship.ship_new_files()
+        st = sess["stats"]
+        k = max(1, st["chunks"])
+        saved = 100 * (1 - st["gpu_chunks"] / k)
+        ship.log(f"{DONE_MARK} live ended ({sess['reason']}): {st['chunks']} chunks, {st['speech_chunks']} speech, "
+                 f"GPU {st['gpu_chunks']} chunks ({saved:.0f}% saved), {ship.streamed/1e6:.1f} MB")
+        ship.close()
+        gens = sorted(st["gen_s"])
+        waits = st["wait_to_speak_s"]
+        tail = st["behind_s"][-20:]
+        out = {"chunks": st["chunks"], "speech_chunks": st["speech_chunks"], "gpu_chunks": st["gpu_chunks"],
+               "gpu_chunk_ratio": round(st["gpu_chunks"] / k, 3), "deferred_chunks": st["deferred_chunks"],
+               "gen_median_s": gens[len(gens) // 2] if gens else None,
+               "behind_max_s": max(st["behind_s"]) if st["behind_s"] else None,
+               "behind_tail_s": max(tail) if tail else None,
+               "wait_to_speak_max_s": max(waits) if waits else 0.0,
+               "wait_to_speak_median_s": sorted(waits)[len(waits) // 2] if waits else 0.0,
+               "ended_by": sess["reason"], "ffmpeg_rc": rc,
+               "peer_sessions": len(self.live_sessions) - 1,
+               "seconds": round(time.time() - sess["t0"], 1)}
+        try:
+            for f in sorted(sess["work"].rglob("*"), reverse=True):
+                f.unlink() if f.is_file() else f.rmdir()
+            sess["work"].rmdir()
+        except OSError:
+            pass
+        return out
     @modal.method()
     def render_stream(
         self,
@@ -701,7 +910,7 @@ class Renderer:
         proc = None
         try:
             log(f"preparing reference (face crop, seed {seed})")
-            get_base_data(self.pipeline, cond_image_path_or_dir=str(img), base_seed=seed, use_face_crop=use_face_crop)
+            sess = self._session(image_bytes, seed, use_face_crop, job_id)
             p = get_infer_params()
             sr, fps = p["sample_rate"], p["tgt_fps"]
             frame_num, motion_frames_num = p["frame_num"], p["motion_frames_num"]
@@ -791,12 +1000,9 @@ class Renderer:
 
             log(f"{n_chunks} chunks to generate, streaming {slice_len / fps:.2f}s segments")
             for i, chunk in enumerate(chunks):
-                c0 = time.time()
-                video = run_pipeline(self.pipeline, chunk)
-                if i != 0:
-                    video = video[motion_frames_num:]
-                frames_q.put(video.cpu().numpy().astype(np.uint8))
-                log(f"chunk {i+1}/{n_chunks} done ({time.time()-c0:.2f}s)")
+                block, gen_s, _ = self._run_chunk(sess, chunk, drop_motion=i != 0)
+                frames_q.put(block)
+                log(f"chunk {i+1}/{n_chunks} done ({gen_s:.2f}s)")
                 ship_new_files()
                 flush()
             frames_q.put(None)
@@ -818,6 +1024,7 @@ class Renderer:
                 raise RuntimeError(f"{len(send_errors)} Queue puts failed, e.g. {send_errors[0]}")
             return {"chunks": n_chunks, "segments": len(sent) - 1, "bytes": streamed[0], "seconds": round(time.time() - t0, 1)}
         finally:
+            self.sessions.pop(job_id, None)
             if sender_thread.is_alive():
                 send_q.put(None)
             if proc is not None and proc.poll() is None:
@@ -1401,6 +1608,94 @@ def _write_mp4(path: pathlib.Path, frames, fps: int) -> bytes:
         for f in frames:
             w.append_data(f)
     return path.read_bytes()
+
+
+@app.local_entrypoint()
+def mux(image: str = "inputs/newscaster.png", audio: str = "inputs/korean_short.wav",
+        sessions: int = 3, minutes: float = 3.0, gap_s: float = 18.0, stagger_s: float = 4.0):
+    """한 컨테이너에 여러 라이브 세션을 붙여 용량을 잰다.
+
+    각 세션은 `gap_s`마다 한 문장씩 말하고 나머지 시간은 대기 루프를 재생한다.
+    세션들은 `stagger_s`만큼 어긋나게 시작해 발화가 겹치는 순간이 생기게 한다.
+    """
+    import threading
+    import uuid
+    import wave
+
+    with wave.open(audio, "rb") as w:
+        pcm = w.readframes(w.getnframes())
+        speech_s = w.getnframes() / w.getframerate()
+    img = pathlib.Path(image).read_bytes()
+    ids = [f"mux-{uuid.uuid4().hex[:8]}" for _ in range(sessions)]
+    print(f"{sessions} sessions · 문장 {speech_s:.1f}s 마다 {gap_s:.0f}s · {minutes:.0f}분 "
+          f"(예상 발화 비중 {speech_s/gap_s*100:.0f}%)", flush=True)
+
+    renderer = modal.Cls.from_name(APP_NAME, "Renderer")()
+    calls = {sid: renderer.live.spawn(sid, img, seed=42, idle_timeout_s=minutes * 60 + 120,
+                                      max_seconds=minutes * 60 + 120) for sid in ids}
+    deadline = time.time() + minutes * 60
+    said = {sid: 0 for sid in ids}
+    ready = {sid: None for sid in ids}
+    finished = threading.Event()        # daemon threads must stop before the client closes
+
+    def drive(sid: str, delay: float) -> None:
+        if finished.wait(delay):
+            return
+        while time.time() < deadline and not finished.is_set():
+            progress.put({"type": "audio", "pcm": pcm, "final": True}, block=False, partition=f"{sid}:audio")
+            said[sid] += 1
+            finished.wait(gap_s)
+        if not finished.is_set():
+            progress.put({"type": "end"}, block=False, partition=f"{sid}:audio")
+
+    def drain(sid: str) -> None:
+        # the studio would be consuming the HLS; here we just keep the queue empty
+        while not finished.is_set():
+            try:
+                for item in progress.get_many(50, block=False, partition=sid):
+                    if isinstance(item, dict) and item.get("type") == "batch":
+                        for it in item["items"]:
+                            if it.get("type") == "log" and "live: ready" in it.get("line", "") and ready[sid] is None:
+                                ready[sid] = time.time()
+            except Exception:  # noqa: BLE001 — the client closes as the run ends
+                return
+            finished.wait(0.5)
+
+    threads = [threading.Thread(target=drive, args=(sid, i * stagger_s), daemon=True) for i, sid in enumerate(ids)]
+    threads += [threading.Thread(target=drain, args=(sid,), daemon=True) for sid in ids]
+    for t in threads:
+        t.start()
+
+    results = {}
+    for sid, call in calls.items():
+        try:
+            results[sid] = call.get(timeout=minutes * 60 + 240)
+        except Exception as exc:  # noqa: BLE001
+            results[sid] = {"error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+    finished.set()
+    for t in threads:
+        t.join(timeout=3)
+
+    print("\n=== 세션별")
+    tot_chunks = tot_gpu = 0
+    for i, (sid, r) in enumerate(results.items()):
+        if "error" in r:
+            print(f"  {i+1}: {r['error']}")
+            continue
+        tot_chunks += r["chunks"]; tot_gpu += r["gpu_chunks"]
+        print(f"  {i+1}: 청크 {r['chunks']:4d} · GPU {r['gpu_chunks']:3d} ({r['gpu_chunk_ratio']*100:.0f}%) · "
+              f"생성 {r['gen_median_s']}s · 영상 지연 최대 {r['behind_max_s']}s / 끝 {r['behind_tail_s']}s · "
+              f"발화 대기 중앙 {r['wait_to_speak_median_s']}s / 최대 {r['wait_to_speak_max_s']}s "
+              f"({r['deferred_chunks']}청크 양보) · 동거 {r['peer_sessions']}")
+    if tot_chunks:
+        ok = [r for r in results.values() if "error" not in r]
+        span = max(r["seconds"] for r in ok)
+        print(f"\n=== 합계: {len(results)} 세션이 컨테이너 1대를 공유 (세션 최장 {span:.0f}s)")
+        print(f"  영상 청크 {tot_chunks} (= {tot_chunks*0.96/60:.1f}분 분량) · GPU 청크 {tot_gpu} "
+              f"({tot_gpu/tot_chunks*100:.0f}%) · GPU가 만든 시간 {tot_gpu*0.96/60:.1f}분")
+        print(f"  실시간 유지: 세션 길이가 요구하는 청크 {span/0.96:.0f} vs 실제 {[r['chunks'] for r in ok]}")
+        print(f"  GPU 점유율 {sum(r['gpu_chunks'] for r in ok)*0.82/span*100:.0f}% · "
+              f"세션당 GPU 비용은 {len(results)}분의 1")
 
 
 @app.local_entrypoint()
