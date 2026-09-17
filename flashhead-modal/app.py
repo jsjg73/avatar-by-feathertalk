@@ -204,6 +204,7 @@ class Renderer:
         # after. Pay them here so a pre-warmed container answers in seconds.
         t1 = time.time()
         import numpy as np
+        import torch
         from flash_head.inference import get_audio_embedding, get_base_data, get_infer_params, run_pipeline
 
         get_base_data(self.pipeline, cond_image_path_or_dir=WARMUP_IMAGE, base_seed=0, use_face_crop=True)
@@ -212,10 +213,14 @@ class Renderer:
         emb = get_audio_embedding(self.pipeline, np.zeros(n, dtype=np.float32))
         t_gen = time.time()
         video = run_pipeline(self.pipeline, emb[:, : p["frame_num"]].contiguous())
-        # seed the per-slot budget's estimate: the warm-up generation is the same
-        # work a live chunk is, so the scheduler should not have to guess on its
-        # first slot (its budget is floor(slot / this))
-        self.gen_ema = time.time() - t_gen     # seeds the scheduler's per-slot budget
+        # Seed the per-slot budget's estimate. The pull to host memory belongs in
+        # the measurement: the scheduler holds the GPU lock across it, so it is
+        # part of what one slot costs. Timing run_pipeline alone read ~0.12 s
+        # optimistic against the in-session median on the same container, which
+        # on a faster GPU is enough to hand the first slots a budget too large.
+        warm = video[self.pipeline.motion_frames_num:].to(torch.uint8).cpu().numpy()
+        self.gen_ema = time.time() - t_gen
+        del warm
         gpu_s = time.time() - t1
         # librosa JIT-compiles (numba) on first use and imageio spins up its
         # ffmpeg plugin on first write — together ~25 s on a fresh container.
@@ -232,7 +237,7 @@ class Renderer:
                 w.setnchannels(1); w.setsampwidth(2); w.setframerate(p["sample_rate"]); w.writeframes(b"\x00\x00" * n)
             librosa.load(f"{d}/w.wav", sr=p["sample_rate"], mono=True)
             with imageio.get_writer(f"{d}/w.mp4", format="mp4", mode="I", fps=p["tgt_fps"], codec="h264", ffmpeg_params=["-bf", "0"]) as w:
-                w.append_data(video[0].cpu().numpy().astype(np.uint8))
+                w.append_data(video[0].to(torch.uint8).cpu().numpy())
         io_s = time.time() - t2
         self.load_seconds = time.time() - t0
         self.loaded_at = time.time()
@@ -254,8 +259,9 @@ class Renderer:
         self.sched_guard = threading.Lock()
         self.slot_t0 = None
         self.slot = 0
-        # NOTE: gen_ema is seeded by the warm-up above; do not reset it here
         self.slot_overruns = 0             # slots where ongoing utterances exceeded the budget
+        # NOTE: gen_ema is seeded by the warm-up above; do not reset it here
+        self.t_swap = self.t_pipe = self.t_xfer = 0.0   # _run_chunk's three parts
         ready_key = f"ready:{self.model_type}"
 
         def beat() -> None:
@@ -320,7 +326,7 @@ class Renderer:
         """Generate one chunk for `sess`, swapping its pipeline state in and out
         under the lock. The audio encoder is read-only, so its work stays outside.
         Returns (frames uint8, generate seconds, seconds spent waiting for the GPU)."""
-        import numpy as np
+        import torch
 
         from flash_head.inference import run_pipeline
 
@@ -332,17 +338,26 @@ class Renderer:
             if sess.get("motion") is not None:
                 pl.latent_motion_frames = sess["motion"]
             pl.generator = sess["generator"]
+            t_swap = time.time()
             video = run_pipeline(pl, emb)
+            t_pipe = time.time()
             sess["motion"] = pl.latent_motion_frames
             if drop_motion:
                 video = video[pl.motion_frames_num:]
-            frames = video.cpu().numpy().astype(np.uint8)
+            frames = video.to(torch.uint8).cpu().numpy()
         gen = time.time() - t0
-        # Record the measurement here, where it is taken: every generation path
-        # goes through this method (warm-up, idle-loop render, clip render, the
-        # scheduler). Keeping it in the scheduler alone threw away the ~11
-        # measurements a container makes before its first live chunk, leaving the
-        # per-slot budget to be computed from an empty estimate.
+        # Split the slot cost three ways. The model's own stages account for
+        # ~0.75 s; the rest is state swap and the pull to host memory, and only
+        # a split measured here says which of the two moved when the total does.
+        self.t_swap = 0.9 * self.t_swap + 0.1 * (t_swap - t0) if self.t_swap else t_swap - t0
+        self.t_pipe = 0.9 * self.t_pipe + 0.1 * (t_pipe - t_swap) if self.t_pipe else t_pipe - t_swap
+        self.t_xfer = 0.9 * self.t_xfer + 0.1 * (gen + t0 - t_pipe) if self.t_xfer else gen + t0 - t_pipe
+        # Record the measurement here, where it is taken: every live generation
+        # path goes through this method (idle-loop render, clip render, the
+        # scheduler); the warm-up in load() seeds it separately. Keeping it in
+        # the scheduler alone threw away the measurements a container makes
+        # before its first live chunk, leaving the per-slot budget to be
+        # computed from an empty estimate.
         self.gen_ema = 0.9 * self.gen_ema + 0.1 * gen if self.gen_ema else gen
         return frames, gen, t0 - w0
 
@@ -717,9 +732,6 @@ class Renderer:
             for s in speakers:
                 if s["want_since"] is None:
                     s["want_since"] = now
-            # a session mid-utterance keeps its turn; otherwise the longest wait wins
-            ongoing = [s for s in speakers if s["speaking"]]
-            waiting = sorted((s for s in speakers if not s["speaking"]), key=lambda s: s["want_since"])
             # A session mid-utterance is never cut: once speech is being played
             # out there is no slack in its audio timeline, so a missed slot shows
             # up as a second of silence in the middle of a sentence. Slicing the
@@ -727,6 +739,8 @@ class Renderer:
             # shrank below the number of speakers already talking (possible on any
             # GPU fast enough for a budget above 1). Overrunning the slot instead
             # is recoverable — idle chunks are free, so the lag is worked off.
+            ongoing = [s for s in speakers if s["speaking"]]
+            waiting = sorted((s for s in speakers if not s["speaking"]), key=lambda s: s["want_since"])
             # compare by id: a session dict holds tensors, so `in` would try to
             # compare those element-wise and raise
             chosen = {s["id"] for s in ongoing}
@@ -829,6 +843,8 @@ class Renderer:
         out = {"chunks": st["chunks"], "speech_chunks": st["speech_chunks"], "gpu_chunks": st["gpu_chunks"],
                "gpu_chunk_ratio": round(st["gpu_chunks"] / k, 3), "deferred_chunks": st["deferred_chunks"],
                "gen_median_s": gens[len(gens) // 2] if gens else None,
+               "gen_swap_s": round(self.t_swap, 3), "gen_pipe_s": round(self.t_pipe, 3),
+               "gen_xfer_s": round(self.t_xfer, 3),
                "behind_max_s": max(st["behind_s"]) if st["behind_s"] else None,
                "behind_tail_s": max(tail) if tail else None,
                "wait_to_speak_max_s": max(waits) if waits else 0.0,
@@ -1522,7 +1538,7 @@ def spike_seam(
         """One chunk: push 0.96 s of audio, generate, return new frames (T,H,W,C) uint8."""
         audio_dq.extend(pcm.tolist())
         emb = get_audio_embedding(pipeline, np.array(audio_dq, dtype=np.float32), start_idx, end_idx)
-        return run_pipeline(pipeline, emb)[motion:].cpu().numpy().astype(np.uint8)
+        return run_pipeline(pipeline, emb)[motion:].to(torch.uint8).cpu().numpy()
 
     def encode_motion(frames_uint8: np.ndarray) -> torch.Tensor:
         """uint8 (T,H,W,C) -> the latent the pipeline expects in latent_motion_frames."""
@@ -1718,6 +1734,8 @@ def mux(image: str = "inputs/newscaster.png", audio: str = "inputs/korean_short.
               f"생성 {r['gen_median_s']}s · 영상 지연 최대 {r['behind_max_s']}s / 끝 {r['behind_tail_s']}s · "
               f"발화 대기 중앙 {r['wait_to_speak_median_s']}s / 최대 {r['wait_to_speak_max_s']}s "
               f"({r['deferred_chunks']}청크 양보) · 동거 {r['peer_sessions']}")
+        print(f"     생성 분해: 상태교체 {r.get('gen_swap_s')}s + 모델 {r.get('gen_pipe_s')}s "
+              f"+ 호스트전송 {r.get('gen_xfer_s')}s")
     if tot_chunks:
         ok = [r for r in results.values() if "error" not in r]
         span = max(r["seconds"] for r in ok)
@@ -1824,7 +1842,7 @@ def spike_return(
     def gen(dq: deque, pcm: np.ndarray) -> np.ndarray:
         dq.extend(pcm.tolist())
         emb = get_audio_embedding(pipeline, np.array(dq, dtype=np.float32), start_idx, end_idx)
-        return run_pipeline(pipeline, emb)[motion:].cpu().numpy().astype(np.uint8)
+        return run_pipeline(pipeline, emb)[motion:].to(torch.uint8).cpu().numpy()
 
     def encode_motion(frames_uint8: np.ndarray) -> torch.Tensor:
         t = torch.from_numpy(np.ascontiguousarray(frames_uint8)).to(pipeline.device, dtype=pipeline.param_dtype)
