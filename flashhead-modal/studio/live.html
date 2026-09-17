@@ -9,6 +9,7 @@
   :root {
     --bg: #0f1115; --panel: #171a21; --panel-2: #1e222b; --line: #2a2f3a;
     --text: #e6e8ee; --muted: #8b93a7; --accent: #6ea8fe; --ok: #5ecf8a; --err: #ff7b7b;
+    --listen: #3d4a63; --wait: #e0a33c;
     --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
   }
   * { box-sizing: border-box; }
@@ -61,6 +62,11 @@
   .g-label { font-size: 11px; color: var(--muted); text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
   .g-track { position: relative; height: 16px; background: var(--panel-2); border-radius: 4px; overflow: hidden; }
   .g-track i { position: absolute; top: 2px; bottom: 2px; background: var(--accent); border-radius: 3px; }
+  /* three disjoint kinds of time, layered so the eye lands on the GPU bars */
+  .g-track i.listen { top: 6px; bottom: 6px; background: var(--listen); border-radius: 2px; }
+  .g-track i.wait { background: var(--wait); }
+  .g-key { display: inline-flex; align-items: center; gap: 5px; margin-right: 12px; }
+  .g-key b { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
   .g-axis { position: relative; height: 16px; }
   .g-axis span { position: absolute; top: 0; font-size: 10px; color: var(--muted); transform: translateX(-50%); }
   .g-axis i { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--line); }
@@ -92,7 +98,7 @@
 <footer>
   <div class="gantt-head">
     <b>GPU 발화 점유</b>
-    <span class="muted" id="ganttInfo">색이 칠해진 구간이 그 세션이 GPU를 쓰며 말한 시간입니다</span>
+    <span class="muted" id="ganttInfo"></span>
     <button id="ganttZoom" class="ghost" style="margin-left:auto;padding:3px 10px;font-size:11.5px">마지막 2분만</button>
   </div>
   <div class="gantt" id="gantt"></div>
@@ -256,14 +262,25 @@ function drawGantt(list) {
   const t0 = zoomRecent ? tEnd - WINDOW_S : full0;
   const span = Math.max(30, tEnd - t0);
   const pct = (t) => Math.max(0, Math.min(100, (t - t0) / span * 100));
-  let html = '', busy = 0, recent = 0;
+  let html = '', busy = 0, recent = 0, waitT = 0, listenT = 0;
   const rStart = tEnd - Math.min(WINDOW_S, span);
+  // one row per session, three disjoint kinds of time: the avatar holding the GPU,
+  // the candidate assumed to be answering, and the avatar queued behind another
+  // session. Drawn listen → wait → GPU so the contended time stays visible.
+  const draw = (spans, cls, label) => (spans || []).filter(([a, b]) => b > t0 && a < tEnd).map(([a, b]) =>
+    `<i class="${cls}" style="left:${pct(a)}%;width:${Math.max(0.3, pct(b) - pct(a))}%" title="${label} ${(b - a).toFixed(1)}초"></i>`).join('');
   for (const s of list) {
-    const bars = s.spans.filter(([a, b]) => b > t0 && a < tEnd).map(([a, b]) => {
-      busy += Math.min(b, tEnd) - Math.max(a, t0);
-      if (b > rStart) recent += Math.min(b, tEnd) - Math.max(a, rStart);
-      return `<i style="left:${pct(a)}%;width:${Math.max(0.3, pct(b) - pct(a))}%" title="${(b - a).toFixed(1)}초"></i>`;
-    }).join('');
+    for (const [a, b] of s.spans) {
+      if (b > t0 && a < tEnd) {
+        busy += Math.min(b, tEnd) - Math.max(a, t0);
+        if (b > rStart) recent += Math.min(b, tEnd) - Math.max(a, rStart);
+      }
+    }
+    for (const [a, b] of (s.wait_spans || [])) if (b > t0 && a < tEnd) waitT += Math.min(b, tEnd) - Math.max(a, t0);
+    for (const [a, b] of (s.listen_spans || [])) if (b > t0 && a < tEnd) listenT += Math.min(b, tEnd) - Math.max(a, t0);
+    const bars = draw(s.listen_spans, 'listen', '응시자 발화(간주)') +
+                 draw(s.wait_spans, 'wait', 'GPU 대기') +
+                 draw(s.spans, '', '아바타 발화');
     const live = ['starting', 'live'].includes(s.state);
     html += `<div class="g-label${live ? '' : ' done'}">${esc(s.avatar)} ${s.id.slice(0, 4)}</div>` +
             `<div class="g-track">${bars}</div>`;
@@ -276,10 +293,16 @@ function drawGantt(list) {
   if (anyLive) axis += `<div class="g-now" style="left:100%"></div>`;
   html += `<div class="g-label">경과</div><div class="g-axis">${axis}</div>`;
   gantt.innerHTML = html;
+  const key = (v, t) => `<span class="g-key"><b style="background:${v}"></b>${t}</span>`;
   $('#ganttInfo').innerHTML =
-    `${zoomRecent ? `마지막 ${WINDOW_S}초` : `전체 ${fmt(span)}`}${anyLive ? ' · 진행 중' : ' · 종료'} · ` +
+    key('var(--accent)', '아바타 발화 (GPU 점유)') +
+    key('var(--listen)', '응시자 발화 (간주)') +
+    key('var(--wait)', 'GPU 대기 (다른 세션이 점유)') +
+    `<br>${zoomRecent ? `마지막 ${WINDOW_S}초` : `전체 ${fmt(span)}`}${anyLive ? ' · 진행 중' : ' · 종료'} · ` +
     `GPU 점유 <b>${Math.round(busy / span * 100)}%</b>` +
     (span > WINDOW_S ? ` (마지막 ${WINDOW_S}초 ${Math.round(recent / Math.min(WINDOW_S, span) * 100)}%)` : '') +
+    (waitT > 0.5 ? ` · 대기 누적 <b>${fmt(waitT)}</b>` : ' · 대기 없음') +
+    (listenT > 0.5 ? ` · 응시자 발화 누적 ${fmt(listenT)}` : '') +
     ` · 한 슬롯에 한 세션만 생성하므로 100%에 가까울수록 질문 시작이 밀립니다`;
 }
 

@@ -247,7 +247,7 @@ def _spawn_render(*args, **kwargs):
 _CHUNK_RE = re.compile(r"chunk (\d+)/(\d+) done")
 _HLS_NAME = re.compile(r"^(init\.mp4|seg_\d+\.m4s|index\.m3u8)$")
 _HLS_MEDIA = {".m3u8": "application/vnd.apple.mpegurl", ".mp4": "video/mp4", ".m4s": "video/iso.segment"}
-_LIVE_RE = re.compile(r"live: chunk (\d+) (speech|silence) gen ([\d.]+)s behind ([\d.]+)s queued ([\d.]+)s")
+_LIVE_RE = re.compile(r"live: chunk (\d+) (speech|deferred|silence) gen ([\d.]+)s behind ([\d.]+)s queued ([\d.]+)s")
 
 
 def _hls_sink(hls_dir: Path, item: dict, parts: dict) -> str | None:
@@ -488,6 +488,26 @@ def _new_playground(name: str = "") -> Playground:
     return p
 
 
+def _subtract(spans: list, holes: list) -> list:
+    """`spans` minus `holes`, both as [start, end] pairs on one clock."""
+    out = []
+    for a, b in spans:
+        cur = [[a, b]]
+        for ha, hb in holes:
+            nxt = []
+            for ca, cb in cur:
+                if hb <= ca or ha >= cb:
+                    nxt.append([ca, cb])
+                    continue
+                if ha > ca:
+                    nxt.append([ca, ha])
+                if hb < cb:
+                    nxt.append([hb, cb])
+            cur = nxt
+        out.extend(c for c in cur if c[1] - c[0] > 0.3)
+    return out
+
+
 @dataclass
 class LiveSession:
     id: str
@@ -509,6 +529,8 @@ class LiveSession:
     # when this session held the GPU, as [start, end] epoch pairs — the Gantt below
     # the grid is drawn straight from these
     spans: list = field(default_factory=list)
+    # slots where this session had speech ready but another session held the GPU
+    wait_spans: list = field(default_factory=list)
     container_t0: float = 0.0       # epoch of the container's own t=0 for this session
     playground: str = ""            # which demo run this session belongs to
     started_live: float = 0.0
@@ -524,6 +546,22 @@ class LiveSession:
     def dir(self) -> Path:
         return LIVE_DIR / self.id
 
+    def listen_spans(self) -> list:
+        """When the candidate is assumed to be answering.
+
+        The demo asks one question per `LIVE_CYCLE_S` and the avatar's own speech
+        is measured, so the candidate's turn is everything between the end of one
+        question and the start of the next. The part where the avatar had its next
+        question ready but was queued behind another session is cut out — that is
+        the system stalling, not the candidate talking, and drawing it as the
+        candidate's turn would hide exactly the contention this chart is for."""
+        if not self.spans:
+            return []
+        edge = time.time() if self.state in ("starting", "live") else (self.finished or self.spans[-1][1])
+        gaps = [[b, (self.spans[i + 1][0] if i + 1 < len(self.spans) else edge)]
+                for i, (_, b) in enumerate(self.spans)]
+        return _subtract([g for g in gaps if g[1] - g[0] > 0.5], self.wait_spans)
+
     def public(self) -> dict:
         d = asdict(self)
         d["log"] = list(self.log)
@@ -531,6 +569,8 @@ class LiveSession:
         d["live_for"] = round((self.finished or time.time()) - self.started_live, 1) if self.started_live else 0.0
         d["gpu_ratio"] = round(self.speech_chunks / self.chunks, 3) if self.chunks else 0.0
         d["spans"] = [[round(a, 2), round(b, 2)] for a, b in self.spans]
+        d["wait_spans"] = [[round(a, 2), round(b, 2)] for a, b in self.wait_spans]
+        d["listen_spans"] = [[round(a, 2), round(b, 2)] for a, b in self.listen_spans()]
         return d
 
 
@@ -620,15 +660,17 @@ def _live_consumer(sess: LiveSession) -> None:
                 m = _LIVE_RE.search(line)
                 if m:
                     sess.chunks = int(m.group(1)); sess.gen_s = float(m.group(3)); sess.behind_s = float(m.group(4)); sess.queued_s = float(m.group(5))
-                    if m.group(2) == "speech":
+                    kind = m.group(2)
+                    if kind == "speech":
                         sess.speech_chunks += 1
-                        if ts and sess.container_t0:
-                            at = sess.container_t0 + float(ts.group(1))
-                            step = SLICE_LEN / FPS
-                            if sess.spans and at - sess.spans[-1][1] <= step * 1.6:
-                                sess.spans[-1][1] = at + step      # same utterance, extend it
-                            else:
-                                sess.spans.append([at, at + step])
+                    if kind in ("speech", "deferred") and ts and sess.container_t0:
+                        at = sess.container_t0 + float(ts.group(1))
+                        step = SLICE_LEN / FPS
+                        into = sess.spans if kind == "speech" else sess.wait_spans
+                        if into and at - into[-1][1] <= step * 1.6:
+                            into[-1][1] = at + step                # same run, extend it
+                        else:
+                            into.append([at, at + step])
                 if "live: ready" in line and not sess.started_live:
                     sess.started_live = time.time()
                 sess.log.append(line[:160])
@@ -1421,6 +1463,7 @@ for meta in LIVE_DIR.glob("*/session.json"):
         s.segments = d.get("segments", 0); s.turns = d.get("turns", 0)
         s.started_live = d.get("started_live", 0); s.finished = d.get("finished", 0)
         s.spans = [list(x) for x in d.get("spans", [])]
+        s.wait_spans = [list(x) for x in d.get("wait_spans", [])]
         s.said = d.get("said", [])
         s.playground = d.get("playground", "")
         s.recording_url = d.get("recording_url", "") if (s.dir / "video.mp4").exists() else ""

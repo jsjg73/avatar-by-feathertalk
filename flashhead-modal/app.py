@@ -771,6 +771,7 @@ class Renderer:
             sess["reason"] = "max_seconds"; sess["open"] = False; sess["done"].set(); return
 
         is_speech = bool(sess["pending"]) and may_speak
+        deferred = False
         if is_speech:
             pcm = sess["pending"].popleft()
             sess["last_speech"] = now
@@ -779,7 +780,11 @@ class Renderer:
                 sess["want_since"] = None
         else:
             pcm = np.zeros(n, dtype=np.float32)
-            if sess["pending"]:
+            # "deferred" and "silence" are different things: deferred means this
+            # session had speech ready and another session held the slot, which is
+            # what the Gantt draws as waiting. Silence means it had nothing to say.
+            deferred = bool(sess["pending"])
+            if deferred:
                 st["deferred_chunks"] += 1
         sess["audio_dq"].extend(pcm.tolist())       # the 8 s window advances either way
 
@@ -820,8 +825,11 @@ class Renderer:
         st["gpu_chunks"] += int(gen > 0)
         st["behind_s"].append(round(behind, 2))
         sess["ship"].ship_new_files()
-        if is_speech or sess["k"] % 20 == 0:
-            sess["ship"].log(f"live: chunk {sess['k']} {'speech' if is_speech else 'silence'} "
+        kind = "speech" if is_speech else ("deferred" if deferred else "silence")
+        # every speech and every deferred chunk is logged: the studio reconstructs
+        # the Gantt's spans from these lines, so a skipped one is a hole in the chart
+        if kind != "silence" or sess["k"] % 20 == 0:
+            sess["ship"].log(f"live: chunk {sess['k']} {kind} "
                              f"gen {gen:.2f}s behind {behind:.2f}s queued {len(sess['pending'])*sess['chunk_s']:.1f}s")
 
     def _close_live(self, sess: dict) -> dict:
