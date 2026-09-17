@@ -411,7 +411,25 @@ threading.Thread(target=_worker, daemon=True, name="studio-worker").start()
 LIVE_DIR = HERE / "live"
 LIVE_DIR.mkdir(exist_ok=True)
 LIVE_CHUNK_SAMPLES = SLICE_LEN * 16000 // FPS          # 15360 samples = 0.96 s
-LIVE_IDLE_TIMEOUT_S = 180.0
+LIVE_IDLE_TIMEOUT_S = 600.0
+# One container serves several sessions (app.py: @modal.concurrent(max_inputs=8)).
+LIVE_MAX_SESSIONS = 8
+# The interview rhythm we are modelling: the avatar asks for ~7 s, the candidate
+# answers for ~35 s. That 1-in-6 speaking ratio is what sets how many sessions
+# fit on one GPU, so the demo drives it rather than leaving it to hand-typing.
+LIVE_SPEAK_S = 7.0
+LIVE_CYCLE_S = 42.0
+# ~40-45 Korean characters is ~7 s in Yuna Premium (measured).
+INTERVIEW_QUESTIONS = [
+    "자기소개를 부탁드립니다. 어떤 일을 해오셨는지 편하게 말씀해 주시면 좋겠습니다.",
+    "최근에 맡으신 프로젝트 중에서 가장 어려웠던 문제는 무엇이었고, 어떻게 해결하셨나요?",
+    "팀에서 의견이 갈렸던 경험이 있다면, 그때 어떤 방식으로 합의를 이끌어내셨는지 궁금합니다.",
+    "지금까지의 경력에서 가장 크게 성장했다고 느낀 순간은 언제였나요? 구체적으로 말씀해 주세요.",
+    "새로운 기술을 익혀야 했던 상황에서 어떤 순서로 접근하시는지, 최근 사례를 들어 설명해 주세요.",
+    "일정이 촉박한 상황에서 품질과 속도 사이를 어떻게 조율하시는지 경험을 들려주시겠어요?",
+    "동료에게 피드백을 줄 때 특별히 신경 쓰시는 점이 있다면 무엇인지 말씀해 주시면 좋겠습니다.",
+    "마지막으로, 저희 팀에 궁금하신 점이나 더 하고 싶으신 말씀이 있으면 편하게 이야기해 주세요.",
+]
 
 
 @dataclass
@@ -430,6 +448,8 @@ class LiveSession:
     behind_s: float = 0.0
     gen_s: float = 0.0
     said: list = field(default_factory=list)
+    auto: bool = False              # drive the interview rhythm from the server
+    turns: int = 0
     started_live: float = 0.0
     finished: float = 0.0
     recording_url: str = ""
@@ -444,6 +464,7 @@ class LiveSession:
         d["log"] = list(self.log)
         d["elapsed"] = round((self.finished or time.time()) - self.created, 1)
         d["live_for"] = round((self.finished or time.time()) - self.started_live, 1) if self.started_live else 0.0
+        d["gpu_ratio"] = round(self.speech_chunks / self.chunks, 3) if self.chunks else 0.0
         return d
 
 
@@ -456,6 +477,25 @@ def live_pro(fresh: bool = False):
     if _live_pro is None or fresh:
         _live_pro = modal.Cls.from_name(fh.APP_NAME, "LivePro")()
     return _live_pro
+
+
+def _auto_driver(sess: LiveSession) -> None:
+    """Ask a question every `LIVE_CYCLE_S`, which is the cadence the capacity
+    numbers assume. Waits for the session to be live so the first question is not
+    swallowed by container start-up."""
+    while sess.state == "starting" and sess.state not in ("ended", "error"):
+        time.sleep(0.5)
+    while sess.auto and sess.state == "live":
+        q = INTERVIEW_QUESTIONS[sess.turns % len(INTERVIEW_QUESTIONS)]
+        sess.turns += 1
+        try:
+            _live_say(sess, q)
+        except Exception as exc:  # noqa: BLE001
+            sess.log.append(f"auto say failed: {type(exc).__name__}: {exc}")
+        for _ in range(int(LIVE_CYCLE_S * 2)):
+            if not (sess.auto and sess.state == "live"):
+                return
+            time.sleep(0.5)
 
 
 def _live_consumer(sess: LiveSession) -> None:
@@ -794,6 +834,7 @@ def config() -> dict:
         "voice": VOICE, "default_avatar": DEFAULT_AVATAR, "max_chars": MAX_CHARS, "mode": "once", "model": "lite",
         "gpu": fh.GPU, "scaledown_s": fh.SCALEDOWN_S, "app": fh.APP_NAME, "tail_s": VIDEO_TAIL_S,
         "audio_max_mb": AUDIO_MAX_BYTES // 1_000_000, "audio_max_seconds": AUDIO_MAX_SECONDS,
+        "live_max_sessions": LIVE_MAX_SESSIONS, "live_speak_s": LIVE_SPEAK_S, "live_cycle_s": LIVE_CYCLE_S,
     }
 
 
@@ -912,10 +953,15 @@ def get_job(job_id: str) -> dict:
 class LiveCreate(BaseModel):
     avatar: str = DEFAULT_AVATAR
     model: str = "lite"
+    auto: bool = True
 
 
 class LiveSay(BaseModel):
     text: str = Field(min_length=1, max_length=MAX_CHARS)
+
+
+class LiveAuto(BaseModel):
+    on: bool
 
 
 @app.post("/api/live")
@@ -924,12 +970,16 @@ def live_start(body: LiveCreate) -> JSONResponse:
         raise HTTPException(422, f"없는 아바타입니다: {body.avatar}")
     if body.model not in ("lite", "pro"):
         raise HTTPException(422, "model은 lite 또는 pro")
-    if any(s.state in ("starting", "live", "ending") for s in live_sessions.values()):
-        raise HTTPException(409, "이미 진행 중인 라이브 세션이 있습니다")
-    sess = LiveSession(id=uuid.uuid4().hex[:10], avatar=body.avatar, created=time.time(), model=body.model)
+    active = [s for s in live_sessions.values() if s.state in ("starting", "live", "ending")]
+    if len(active) >= LIVE_MAX_SESSIONS:
+        raise HTTPException(409, f"동시 세션은 {LIVE_MAX_SESSIONS}개까지입니다 (컨테이너 1대 기준)")
+    sess = LiveSession(id=uuid.uuid4().hex[:10], avatar=body.avatar, created=time.time(),
+                       model=body.model, auto=body.auto)
     live_sessions[sess.id] = sess
-    sess.log.append("session created")
+    sess.log.append(f"session created (auto={body.auto})")
     threading.Thread(target=_live_consumer, args=(sess,), daemon=True, name=f"live-{sess.id}").start()
+    if sess.auto:
+        threading.Thread(target=_auto_driver, args=(sess,), daemon=True, name=f"auto-{sess.id}").start()
     return JSONResponse(sess.public(), status_code=201)
 
 
@@ -996,6 +1046,17 @@ async def live_say_audio(sid: str, file: UploadFile = File(...)) -> dict:
 
     threading.Thread(target=run, daemon=True).start()
     sess.log.append(f"say queued (audio): {name} ({len(data)/1e6:.1f} MB)")
+    return sess.public()
+
+
+@app.post("/api/live/{sid}/auto")
+def live_auto(sid: str, body: LiveAuto) -> dict:
+    sess = live_sessions.get(sid)
+    if not sess:
+        raise HTTPException(404, "no such session")
+    was, sess.auto = sess.auto, body.on
+    if body.on and not was and sess.state in ("starting", "live"):
+        threading.Thread(target=_auto_driver, args=(sess,), daemon=True, name=f"auto-{sid}").start()
     return sess.public()
 
 
