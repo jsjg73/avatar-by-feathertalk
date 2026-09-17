@@ -470,7 +470,7 @@ class LiveSession:
         d["elapsed"] = round((self.finished or time.time()) - self.created, 1)
         d["live_for"] = round((self.finished or time.time()) - self.started_live, 1) if self.started_live else 0.0
         d["gpu_ratio"] = round(self.speech_chunks / self.chunks, 3) if self.chunks else 0.0
-        d["spans"] = [[round(a, 2), round(b, 2)] for a, b in self.spans[-120:]]
+        d["spans"] = [[round(a, 2), round(b, 2)] for a, b in self.spans]
         return d
 
 
@@ -1129,6 +1129,22 @@ def live_stop(sid: str) -> dict:
     return sess.public()
 
 
+@app.delete("/api/live/{sid}")
+def live_forget(sid: str) -> dict:
+    """Drop one ended session from the demo screen. Files on disk are kept."""
+    sess = live_sessions.get(sid)
+    if not sess:
+        raise HTTPException(404, "no such session")
+    if sess.state in ("starting", "live", "ending"):
+        raise HTTPException(409, "진행 중인 세션입니다")
+    live_sessions.pop(sid, None)
+    # also stop it coming back on the next restart; the recording stays on disk
+    meta = sess.dir / "session.json"
+    if meta.exists():
+        meta.rename(sess.dir / "session.hidden.json")
+    return {"removed": sid}
+
+
 @app.get("/hls/live/{sid}/{name}")
 def hls_live_file(sid: str, name: str) -> FileResponse:
     if not _HLS_NAME.match(name):
@@ -1203,6 +1219,29 @@ def video(job_id: str) -> FileResponse:
     if not p.exists():
         raise HTTPException(404, "not rendered")
     return FileResponse(p, media_type="video/mp4")
+
+
+# reload finished live sessions too: the demo screen keeps their recording and
+# their Gantt row, so a server restart must not erase the history
+for meta in LIVE_DIR.glob("*/session.json"):
+    try:
+        d = json.loads(meta.read_text())
+        if d["id"] in live_sessions:
+            continue
+        s = LiveSession(id=d["id"], avatar=d.get("avatar", DEFAULT_AVATAR), created=d.get("created", 0),
+                        model=d.get("model", "lite"))
+        s.state = "ended" if d.get("state") in ("ended", "ending", "live", "starting") else d.get("state", "ended")
+        s.error = d.get("error", "")
+        s.chunks = d.get("chunks", 0); s.speech_chunks = d.get("speech_chunks", 0)
+        s.segments = d.get("segments", 0); s.turns = d.get("turns", 0)
+        s.started_live = d.get("started_live", 0); s.finished = d.get("finished", 0)
+        s.spans = [list(x) for x in d.get("spans", [])]
+        s.said = d.get("said", [])
+        s.recording_url = d.get("recording_url", "") if (s.dir / "video.mp4").exists() else ""
+        s.log.extend(d.get("log", [])[-30:])
+        live_sessions[s.id] = s
+    except Exception:  # noqa: BLE001
+        continue
 
 
 # reload finished jobs from disk so a server restart keeps the gallery
