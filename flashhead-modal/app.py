@@ -138,6 +138,17 @@ def fetch_weights(include_pro: bool = False) -> str:
     return subprocess.run(["du", "-sh", WEIGHTS], capture_output=True, text=True).stdout.strip()
 
 
+IDLE_DIR = f"{WEIGHTS}/idle_loops"
+IDLE_CHUNKS = 10                      # ~9.6 s of loop; long enough that a repeat is not obvious
+
+
+def _idle_loop_path(image_bytes: bytes, seed: int, model_type: str) -> pathlib.Path:
+    import hashlib
+
+    key = hashlib.sha256(image_bytes + f"|{seed}|{model_type}|{IDLE_CHUNKS}".encode()).hexdigest()[:16]
+    return pathlib.Path(IDLE_DIR) / f"{key}.mp4"
+
+
 def _emit(job_id: str, line: str) -> None:
     print(line, flush=True)
     try:
@@ -375,6 +386,8 @@ class Renderer:
         idle_timeout_s: float = 180.0,
         max_seconds: float = 1800.0,
         lead_chunks: float = 1.0,
+        use_idle_loop: bool = True,
+        fade_frames: int = 4,
     ) -> dict:
         """A live session: upstream *stream* mode paced to the wall clock.
 
@@ -384,6 +397,15 @@ class Renderer:
         rolling window and generates 24 new frames, then ships HLS segments to
         partition `<session_id>` like render_stream. Ends on an {"type": "end"}
         item, after `idle_timeout_s` without speech, or at `max_seconds`.
+
+        With `use_idle_loop` the silent chunks are not generated at all: a loop
+        rendered once per avatar (cached in the weights Volume) plays instead, so
+        the GPU only works while the avatar speaks. Both hand-offs were measured
+        (`spike_seam`, `spike_return`): entering generation from the loop is free
+        — the loop's last 9 frames go into `latent_motion_frames`, which is what
+        the model conditions on anyway — while returning needs a short cross-fade,
+        since a hard cut jumps 6.25 MAD against a natural frame step of 2.7 and a
+        4-frame fade brings it to 1.66.
 
         Latency budget on a warm L4 (Lite): audio put→get ≈0.7 s, wait for the
         next chunk slot ≤0.96 s, generate 0.8 s, segment closes with the next
@@ -407,7 +429,7 @@ class Renderer:
         ship = _HlsShipper(session_id, hls, t0)
         audio_part = f"{session_id}:audio"
         proc = None
-        stats = {"chunks": 0, "speech_chunks": 0, "gen_s": [], "behind_s": [], "ended_by": ""}
+        stats = {"chunks": 0, "speech_chunks": 0, "gpu_chunks": 0, "gen_s": [], "behind_s": [], "ended_by": ""}
         try:
             ship.log(f"live: preparing reference (face crop, seed {seed})")
             get_base_data(self.pipeline, cond_image_path_or_dir=str(work / "ref.png"), base_seed=seed, use_face_crop=use_face_crop)
@@ -454,6 +476,38 @@ class Renderer:
             last_speech = time.time()
             stream_t0 = None
             k = 0
+            # ---- idle loop: rendered once per avatar, then reused by every session
+            idle_loop = None
+            if use_idle_loop:
+                import imageio
+
+                loop_path = _idle_loop_path(image_bytes, seed, self.model_type)
+                loop_path.parent.mkdir(parents=True, exist_ok=True)
+                if not loop_path.exists():
+                    t_loop = time.time()
+                    dq: deque = deque([0.0] * cached, maxlen=cached)
+                    made = []
+                    for _ in range(IDLE_CHUNKS):
+                        dq.extend(np.zeros(chunk_samples, dtype=np.float32).tolist())
+                        e = get_audio_embedding(self.pipeline, np.array(dq, dtype=np.float32), audio_start_idx, audio_end_idx)
+                        made.append(run_pipeline(self.pipeline, e)[motion:].cpu().numpy().astype(np.uint8))
+                    tmp_loop = loop_path.with_name(f".{loop_path.stem}.{os.getpid()}.tmp.mp4")
+                    with imageio.get_writer(str(tmp_loop), format="mp4", mode="I", fps=fps, codec="h264",
+                                            ffmpeg_params=["-bf", "0", "-crf", "20", "-preset", "veryfast", "-pix_fmt", "yuv420p"]) as w:
+                        for block in made:
+                            for f in block:
+                                w.append_data(f)
+                    tmp_loop.replace(loop_path)
+                    weights.commit()
+                    ship.log(f"live: idle loop rendered in {time.time()-t_loop:.0f}s → {loop_path.name}")
+                reader = imageio.get_reader(str(loop_path))
+                idle_loop = np.stack([np.asarray(f) for f in reader])
+                reader.close()
+                ship.log(f"live: idle loop ready ({len(idle_loop)} frames) — GPU rests while the avatar listens")
+            loop_pos = 0
+            speaking = False
+            last_frame = None
+
             ship.log(f"live: ready — {chunk_s:.2f}s chunks, idle timeout {idle_timeout_s:.0f}s")
             while True:
                 # ingest speech / control items
@@ -490,15 +544,36 @@ class Renderer:
                 else:
                     pcm = np.zeros(chunk_samples, dtype=np.float32); is_speech = False
                 g0 = time.time()
-                audio_dq.extend(pcm.tolist())
-                emb = get_audio_embedding(self.pipeline, np.array(audio_dq, dtype=np.float32), audio_start_idx, audio_end_idx)
-                video = run_pipeline(self.pipeline, emb)[motion:]
-                vq.put(video.cpu().numpy().astype(np.uint8))
+                audio_dq.extend(pcm.tolist())          # the 8 s window advances either way
+                if idle_loop is not None and not is_speech:
+                    frames = np.take(idle_loop, range(loop_pos, loop_pos + slice_len), axis=0, mode="wrap")
+                    loop_pos = (loop_pos + slice_len) % len(idle_loop)
+                    if speaking:                       # first silent chunk after a turn: fade back into the loop
+                        frames = frames.copy()
+                        wts = np.linspace(0, 1, fade_frames + 2)[1:-1].reshape(-1, 1, 1, 1)
+                        frames[:fade_frames] = (last_frame.astype(np.float32) * (1 - wts)
+                                                + frames[:fade_frames].astype(np.float32) * wts).astype(np.uint8)
+                        speaking = False
+                    gen = 0.0
+                else:
+                    if idle_loop is not None and not speaking:
+                        # entering generation: continue from the frames the viewer is seeing
+                        seen = np.take(idle_loop, range(loop_pos - motion, loop_pos), axis=0, mode="wrap")
+                        t = torch.from_numpy(np.ascontiguousarray(seen)).to(self.pipeline.device, dtype=self.pipeline.param_dtype)
+                        self.pipeline.latent_motion_frames = self.pipeline.vae.encode(((t / 255 - 0.5) * 2).permute(3, 0, 1, 2).unsqueeze(0))
+                        speaking = True
+                    emb = get_audio_embedding(self.pipeline, np.array(audio_dq, dtype=np.float32), audio_start_idx, audio_end_idx)
+                    frames = run_pipeline(self.pipeline, emb)[motion:].cpu().numpy().astype(np.uint8)
+                    gen = time.time() - g0
+                vq.put(frames)
+                last_frame = frames[-1]
                 aq.put((np.clip(pcm, -1.0, 1.0) * 32767).astype(np.int16).tobytes())
-                gen = time.time() - g0
                 k += 1
                 stats["chunks"] = k; stats["speech_chunks"] += int(is_speech)
-                stats["gen_s"].append(round(gen, 3)); stats["behind_s"].append(round(behind, 2))
+                stats["gpu_chunks"] += int(gen > 0)
+                if gen > 0:
+                    stats["gen_s"].append(round(gen, 3))
+                stats["behind_s"].append(round(behind, 2))
                 ship.ship_new_files()
                 if is_speech or k % 10 == 0 or k <= 3:
                     ship.log(f"live: chunk {k} {'speech' if is_speech else 'silence'} gen {gen:.2f}s behind {behind:.2f}s queued {len(pending)*chunk_s:.1f}s")
@@ -506,9 +581,12 @@ class Renderer:
             vq.put(None); aq.put(None)
             rc = proc.wait(timeout=120)
             ship.ship_new_files()
-            ship.log(f"{DONE_MARK} live ended ({stats['ended_by']}): {k} chunks, {stats['speech_chunks']} speech, {ship.streamed/1e6:.1f} MB")
+            saved = 100 * (1 - stats["gpu_chunks"] / k) if k else 0
+            ship.log(f"{DONE_MARK} live ended ({stats['ended_by']}): {k} chunks, {stats['speech_chunks']} speech, "
+                     f"GPU {stats['gpu_chunks']} chunks ({saved:.0f}% saved), {ship.streamed/1e6:.1f} MB")
             ship.close()
             stats["gen_median_s"] = sorted(stats["gen_s"])[len(stats["gen_s"]) // 2] if stats["gen_s"] else None
+            stats["gpu_chunk_ratio"] = round(stats["gpu_chunks"] / k, 3) if k else None
             stats["behind_max_s"] = max(stats["behind_s"]) if stats["behind_s"] else None
             stats["ffmpeg_rc"] = rc
             stats.pop("gen_s"); stats.pop("behind_s")
@@ -1356,6 +1434,172 @@ def seam(image: str = "inputs/newscaster.png", audio: str = "inputs/korean_flash
         pc = c["divergence_per_chunk"]
         print(f"  {name:18s} 경계 점프 {c['boundary_mad']:6.2f} | 발화 중 프레임 간 {c['intra_frame_mad_speech']:6.2f} | 대조군 대비 {c['divergence_from_control']:7.3f}")
         print(f"                     청크별 발산: {' '.join(f'{v:.1f}' for v in pc[:12])}{' …' if len(pc) > 12 else ''}  (마지막 {pc[-1]:.1f})")
+    print(f"\n저장: {d}/")
+
+
+# ---------------------------------------------------------------------------
+# Spike 2: the reverse hand-off — generation back to the idle loop.
+#
+# `spike_seam` proved loop -> generation is invisible. A turn also has to END:
+# when the avatar stops talking the stream must return to the loop, and the
+# loop's frames are fixed while the last generated frame is whatever the model
+# produced. Four strategies, measured against the natural frame-to-frame step:
+#   R1 cut to the loop's first frame            (naive)
+#   R2 cut to the loop frame nearest that pose  (the loop is ~240 frames, so search it)
+#   R3 R2 plus a short cross-fade
+#   R4 generate a couple of silent chunks first to let the face settle, then R3
+@app.function(image=image, gpu=GPU, volumes={WEIGHTS: weights, CACHE: cache}, timeout=1800)
+def spike_return(
+    image_bytes: bytes,
+    audio_bytes: bytes,
+    seed: int = 42,
+    idle_chunks: int = 10,
+    speech_chunks: int = 8,
+    settle_chunks: int = 2,
+    fade_frames: int = 4,
+) -> dict:
+    import os
+    import sys
+    import tempfile
+    from collections import deque
+
+    os.chdir(SRC)
+    sys.path.insert(0, SRC)
+
+    import imageio
+    import librosa
+    import numpy as np
+    import torch
+
+    from flash_head.inference import (
+        get_audio_embedding,
+        get_base_data,
+        get_infer_params,
+        get_pipeline,
+        run_pipeline,
+    )
+
+    work = pathlib.Path(tempfile.mkdtemp(prefix="spike-ret-"))
+    (work / "ref.png").write_bytes(image_bytes)
+    (work / "speech.wav").write_bytes(audio_bytes)
+
+    t0 = time.time()
+    pipeline = get_pipeline(world_size=1, ckpt_dir=CKPT, model_type="lite", wav2vec_dir=WAV2VEC)
+    get_base_data(pipeline, cond_image_path_or_dir=str(work / "ref.png"), base_seed=seed, use_face_crop=True)
+    p = get_infer_params()
+    sr, fps = p["sample_rate"], p["tgt_fps"]
+    frame_num, motion = p["frame_num"], p["motion_frames_num"]
+    slice_len = frame_num - motion
+    chunk_samples = slice_len * sr // fps
+    cached = p["cached_audio_duration"] * sr
+    end_idx = p["cached_audio_duration"] * fps
+    start_idx = end_idx - frame_num
+
+    def gen(dq: deque, pcm: np.ndarray) -> np.ndarray:
+        dq.extend(pcm.tolist())
+        emb = get_audio_embedding(pipeline, np.array(dq, dtype=np.float32), start_idx, end_idx)
+        return run_pipeline(pipeline, emb)[motion:].cpu().numpy().astype(np.uint8)
+
+    def encode_motion(frames_uint8: np.ndarray) -> torch.Tensor:
+        t = torch.from_numpy(np.ascontiguousarray(frames_uint8)).to(pipeline.device, dtype=pipeline.param_dtype)
+        t = (t / 255 - 0.5) * 2
+        return pipeline.vae.encode(t.permute(3, 0, 1, 2).unsqueeze(0))
+
+    def mad(a, b) -> float:
+        return float(np.mean(np.abs(a.astype(np.int16) - b.astype(np.int16))))
+
+    silence = np.zeros(chunk_samples, dtype=np.float32)
+
+    # idle loop, stored and read back as mp4 like production would
+    dq: deque = deque([0.0] * cached, maxlen=cached)
+    idle = np.concatenate([gen(dq, silence) for _ in range(idle_chunks)])
+    loop_mp4 = work / "idle_loop.mp4"
+    with imageio.get_writer(str(loop_mp4), format="mp4", mode="I", fps=fps, codec="h264",
+                            ffmpeg_params=["-bf", "0", "-crf", "20", "-preset", "veryfast", "-pix_fmt", "yuv420p"]) as w:
+        for f in idle:
+            w.append_data(f)
+    reader = imageio.get_reader(str(loop_mp4))
+    loop = np.stack([np.asarray(f) for f in reader])
+    reader.close()
+    audio_state = list(dq)
+
+    # a speaking turn, entered from the loop (the proven direction)
+    speech, _ = librosa.load(str(work / "speech.wav"), sr=sr, mono=True)
+    need = (speech_chunks + settle_chunks) * chunk_samples
+    speech = np.concatenate([speech, np.zeros(max(0, need - len(speech)), dtype=np.float32)])
+    pipeline.latent_motion_frames = encode_motion(loop[-motion:])
+    pipeline.generator.manual_seed(seed)
+    dq = deque(audio_state, maxlen=cached)
+    spoken = np.concatenate([gen(dq, speech[i * chunk_samples : (i + 1) * chunk_samples]) for i in range(speech_chunks)])
+    # optional settle: keep generating, now on silence, so the face relaxes
+    settled = np.concatenate([gen(dq, silence) for _ in range(settle_chunks)]) if settle_chunks else spoken[:0]
+
+    def nearest(frame: np.ndarray) -> tuple:
+        d = [mad(frame, loop[i]) for i in range(len(loop))]
+        i = int(np.argmin(d))
+        return i, float(d[i])
+
+    def fade(a_tail: np.ndarray, b_head: np.ndarray, n: int) -> np.ndarray:
+        w = np.linspace(0, 1, n + 2)[1:-1].reshape(-1, 1, 1, 1)
+        return (a_tail.astype(np.float32) * (1 - w) + b_head.astype(np.float32) * w).astype(np.uint8)
+
+    natural = float(np.mean([mad(loop[i], loop[i + 1]) for i in range(len(loop) - 1)]))
+    res = {"natural_frame_step_idle": round(natural, 2),
+           "intra_frame_step_speech": round(float(np.mean([mad(spoken[i], spoken[i + 1]) for i in range(len(spoken) - 1)])), 2),
+           "strategies": {}}
+    clips = {}
+
+    def evaluate(name: str, last: np.ndarray, resume_at: int, fade_n: int, pre: np.ndarray) -> None:
+        head = loop[resume_at : resume_at + 50]
+        if len(head) < 50:                                   # wrap the loop
+            head = np.concatenate([head, loop[: 50 - len(head)]])
+        bridge = (fade(np.repeat(last[None], fade_n, axis=0), head[:fade_n], fade_n)
+                  if fade_n else np.empty((0,) + last.shape, dtype=np.uint8))
+        joined = np.concatenate([pre[-50:], bridge, head])
+        # the jump the eye would see: last frame before the loop vs first loop frame shown
+        before = bridge[-1] if fade_n else last
+        res["strategies"][name] = {"resume_frame": resume_at, "fade_frames": fade_n,
+                                   "jump_mad": round(mad(before, head[0] if not fade_n else head[fade_n]), 2),
+                                   "vs_natural": round((mad(before, head[0] if not fade_n else head[fade_n])) / natural, 2)}
+        clips[name] = joined
+
+    last_spoken = spoken[-1]
+    evaluate("R1_cut_to_loop_start", last_spoken, 0, 0, spoken)
+    i2, d2 = nearest(last_spoken)
+    evaluate("R2_cut_to_nearest", last_spoken, i2, 0, spoken)
+    res["strategies"]["R2_cut_to_nearest"]["nearest_distance"] = round(d2, 2)
+    evaluate("R3_nearest_plus_fade", last_spoken, i2, fade_frames, spoken)
+    if settle_chunks:
+        last_settled = settled[-1]
+        i4, d4 = nearest(last_settled)
+        evaluate("R4_settle_then_fade", last_settled, i4, fade_frames, np.concatenate([spoken, settled]))
+        res["strategies"]["R4_settle_then_fade"]["nearest_distance"] = round(d4, 2)
+        res["strategies"]["R4_settle_then_fade"]["settle_chunks"] = settle_chunks
+
+    out_clips = {}
+    for name, frames in clips.items():
+        out_clips[name] = _write_mp4(work / f"{name}.mp4", frames, fps)
+    res["seconds"] = round(time.time() - t0, 1)
+    print("RESULT " + json.dumps(res), flush=True)
+    return {"metrics": res, "clips": out_clips}
+
+
+@app.local_entrypoint()
+def ret(image: str = "inputs/newscaster.png", audio: str = "inputs/korean_flashhead.wav", out_dir: str = "spike-return"):
+    """생성 → 대기 루프 복귀 전환 스파이크."""
+    import json as _json
+
+    d = pathlib.Path(out_dir)
+    d.mkdir(exist_ok=True)
+    r = spike_return.remote(pathlib.Path(image).read_bytes(), pathlib.Path(audio).read_bytes())
+    (d / "metrics.json").write_text(_json.dumps(r["metrics"], indent=1, ensure_ascii=False))
+    for name, data in r["clips"].items():
+        (d / f"{name}.mp4").write_bytes(data)
+    m = r["metrics"]
+    print(f"\n자연스러운 프레임 간 변화: 무음 {m['natural_frame_step_idle']} / 발화 {m['intra_frame_step_speech']}")
+    for name, v in m["strategies"].items():
+        extra = f" · 최근접 거리 {v['nearest_distance']}" if "nearest_distance" in v else ""
+        print(f"  {name:24s} 복귀 점프 {v['jump_mad']:6.2f}  (자연 변화의 {v['vs_natural']:.1f}배){extra}")
     print(f"\n저장: {d}/")
 
 

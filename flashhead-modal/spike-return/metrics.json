@@ -1,0 +1,34 @@
+{
+ "natural_frame_step_idle": 0.58,
+ "intra_frame_step_speech": 2.7,
+ "strategies": {
+  "R1_cut_to_loop_start": {
+   "resume_frame": 0,
+   "fade_frames": 0,
+   "jump_mad": 6.25,
+   "vs_natural": 10.73
+  },
+  "R2_cut_to_nearest": {
+   "resume_frame": 0,
+   "fade_frames": 0,
+   "jump_mad": 6.25,
+   "vs_natural": 10.73,
+   "nearest_distance": 6.25
+  },
+  "R3_nearest_plus_fade": {
+   "resume_frame": 0,
+   "fade_frames": 4,
+   "jump_mad": 1.66,
+   "vs_natural": 2.85
+  },
+  "R4_settle_then_fade": {
+   "resume_frame": 9,
+   "fade_frames": 4,
+   "jump_mad": 2.08,
+   "vs_natural": 3.57,
+   "nearest_distance": 6.38,
+   "settle_chunks": 2
+  }
+ },
+ "seconds": 55.5
+}

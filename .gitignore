@@ -45,3 +45,5 @@ flashhead-runpod/inputs/
 
 # 스파이크 산출 영상 (수치와 스트립은 추적)
 flashhead-modal/spike-seam/*.mp4
+
+flashhead-modal/spike-return/*.mp4
