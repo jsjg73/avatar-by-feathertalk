@@ -420,6 +420,13 @@ LIVE_MAX_SESSIONS = 8
 # fit on one GPU, so the demo drives it rather than leaving it to hand-typing.
 LIVE_SPEAK_S = 7.0
 LIVE_CYCLE_S = 42.0
+# Sessions start one at a time. Each start uploads the avatar PNG (~0.8 MB) in the
+# spawn payload, so six "+" clicks in two seconds push ~5 MB through one Modal
+# client at once — enough for a 1-second QueueGet to miss its deadline.
+LIVE_START_SPACING_S = 1.5
+# A failed poll says nothing about the session: the container keeps generating and
+# the queue keeps the items. Only give up after this many consecutive failures.
+LIVE_CLIENT_RETRIES = 30
 # ~40-45 Korean characters is ~7 s in Yuna Premium (measured).
 INTERVIEW_QUESTIONS = [
     "자기소개를 부탁드립니다. 어떤 일을 해오셨는지 편하게 말씀해 주시면 좋겠습니다.",
@@ -535,6 +542,21 @@ def live_pro(fresh: bool = False):
     return _live_pro
 
 
+_live_start_gate = threading.Lock()
+_live_last_start = 0.0
+
+
+def _await_start_slot(sess: LiveSession) -> None:
+    """Space session starts out so their avatar uploads do not collide."""
+    global _live_last_start
+    with _live_start_gate:
+        wait = LIVE_START_SPACING_S - (time.time() - _live_last_start)
+        if wait > 0:
+            sess.log.append(f"앞 세션과 {wait:.1f}s 간격을 두고 시작")
+            time.sleep(wait)
+        _live_last_start = time.time()
+
+
 def _auto_driver(sess: LiveSession) -> None:
     """Ask a question every `LIVE_CYCLE_S`, which is the cadence the capacity
     numbers assume. Waits for the session to be live so the first question is not
@@ -565,6 +587,7 @@ def _live_consumer(sess: LiveSession) -> None:
         handle = live_pro if sess.model == "pro" else renderer
         where = "LivePro.live (2×H100 jp)" if sess.model == "pro" else "Renderer.live (L4)"
         sess.log.append(f"Modal: {where} → {fh.APP_NAME}, avatar {image.name}")
+        _await_start_slot(sess)
         try:
             call = handle().live.spawn(sess.id, image.read_bytes(), seed=42, idle_timeout_s=LIVE_IDLE_TIMEOUT_S)
         except Exception as exc:  # noqa: BLE001
@@ -613,14 +636,24 @@ def _live_consumer(sess: LiveSession) -> None:
                     sess.log.append("streaming: live playlist ready")
 
         t0 = time.time()
+        transient = 0          # consecutive client-side failures
         while True:
             if time.time() - t0 > RENDER_TIMEOUT_S + 600:
                 call.cancel()
                 raise TimeoutError("live session exceeded the maximum duration")
+            if transient > LIVE_CLIENT_RETRIES:
+                raise ConnectionError(f"컨테이너와 {transient}회 연속 통신 실패")
             try:
                 items = fh.progress.get_many(20, block=True, timeout=1, partition=sess.id)
+                transient = 0
             except stdqueue.Empty:
-                items = []
+                items, transient = [], 0
+            except Exception as exc:  # noqa: BLE001 — the session outlives a failed poll
+                transient += 1
+                if transient == 1 or transient % 10 == 0:
+                    sess.log.append(f"client: {type(exc).__name__}: {str(exc)[:70]} — 재시도 {transient}")
+                time.sleep(min(0.3 * transient, 3.0))
+                continue
             if items:
                 for it in items:
                     handle(it)
@@ -629,7 +662,12 @@ def _live_consumer(sess: LiveSession) -> None:
                 stats = call.get(timeout=0)
                 break
             except TimeoutError:
-                pass
+                pass               # still running
+            except Exception as exc:  # noqa: BLE001
+                transient += 1
+                if transient == 1 or transient % 10 == 0:
+                    sess.log.append(f"client: {type(exc).__name__}: {str(exc)[:70]} — 재시도 {transient}")
+                time.sleep(min(0.3 * transient, 3.0))
         for it in fh.progress.get_many(100, block=False, partition=sess.id):
             handle(it)
         sess.stats = stats
