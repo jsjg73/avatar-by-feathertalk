@@ -1,20 +1,20 @@
 {
  "idle_frames": 240,
  "idle_mp4_mb": 0.52,
- "h264_roundtrip_mad": 3.052,
+ "h264_roundtrip_mad": 3.05,
  "intra_frame_mad_idle": 1.73,
  "conditions": {
   "C_control_float": {
-   "boundary_mad": 4.38,
-   "intra_frame_mad_speech": 3.05,
+   "boundary_mad": 3.9,
+   "intra_frame_mad_speech": 3.08,
    "divergence_from_control": 0.0,
    "mean_rgb_first3": [
-    69.3,
-    81.1,
-    118.9
+    69.1,
+    81.3,
+    119.0
    ],
    "mean_rgb_last3": [
-    70.2,
+    69.8,
     81.2,
     118.8
    ],
@@ -47,94 +47,94 @@
    ]
   },
   "A_uint8_memory": {
-   "boundary_mad": 4.34,
-   "intra_frame_mad_speech": 3.04,
-   "divergence_from_control": 1.425,
+   "boundary_mad": 3.91,
+   "intra_frame_mad_speech": 3.16,
+   "divergence_from_control": 1.47,
    "mean_rgb_first3": [
-    69.7,
-    81.4,
-    119.1
-   ],
-   "mean_rgb_last3": [
-    70.2,
-    81.3,
-    118.9
-   ],
-   "divergence_per_chunk": [
-    1.4,
-    1.36,
-    1.34,
-    1.46,
-    1.42,
-    1.6,
-    1.52,
-    1.4,
-    2.36,
-    1.4,
-    1.35,
-    1.34,
-    1.21,
-    1.3,
-    1.36,
-    1.35,
-    1.35,
-    1.41,
-    1.25,
-    1.41,
-    1.54,
-    1.21,
-    1.55,
-    1.42,
-    1.3
-   ]
-  },
-  "B_h264_file": {
-   "boundary_mad": 4.6,
-   "intra_frame_mad_speech": 3.06,
-   "divergence_from_control": 1.815,
-   "mean_rgb_first3": [
-    69.1,
+    69.5,
     81.3,
     119.0
    ],
    "mean_rgb_last3": [
-    70.2,
+    69.6,
+    81.2,
+    118.7
+   ],
+   "divergence_per_chunk": [
+    1.47,
+    1.76,
+    1.49,
+    1.42,
+    2.01,
+    1.66,
+    1.66,
+    1.38,
+    1.81,
+    1.43,
+    1.35,
+    1.41,
+    1.31,
+    1.4,
+    1.45,
+    1.49,
+    1.44,
+    1.38,
+    1.38,
+    1.46,
+    1.46,
+    1.22,
+    1.26,
+    1.32,
+    1.35
+   ]
+  },
+  "B_h264_file": {
+   "boundary_mad": 4.44,
+   "intra_frame_mad_speech": 2.89,
+   "divergence_from_control": 1.845,
+   "mean_rgb_first3": [
+    69.5,
+    81.5,
+    119.3
+   ],
+   "mean_rgb_last3": [
+    70.3,
     81.3,
     118.8
    ],
    "divergence_per_chunk": [
-    4.11,
-    3.47,
-    2.34,
-    2.03,
-    2.18,
-    2.18,
-    2.33,
-    1.66,
-    1.87,
-    1.42,
-    1.6,
-    1.52,
-    1.35,
+    3.88,
+    3.54,
+    2.28,
+    1.96,
+    3.44,
+    2.8,
+    2.86,
+    1.74,
+    1.54,
+    1.36,
+    1.31,
     1.49,
+    1.33,
     1.52,
-    1.71,
-    1.48,
-    1.44,
-    1.35,
-    1.53,
-    1.7,
-    1.27,
-    1.23,
-    1.35,
-    1.26
+    1.45,
+    1.34,
+    1.41,
+    1.32,
+    1.4,
+    1.49,
+    1.65,
+    1.22,
+    1.21,
+    1.28,
+    1.3
    ]
   }
  },
  "mean_rgb_last_idle": [
-  70.6,
-  81.2,
+  70.8,
+  81.4,
   119.0
  ],
- "seconds": 117.8
+ "seconds": 125.3
 }

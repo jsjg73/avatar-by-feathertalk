@@ -1289,10 +1289,30 @@ def spike_seam(
         path = work / f"strip_{name}.png"
         imageio.imwrite(str(path), strip)
         strips[name] = path.read_bytes()
+    # ---- hand-off clips for the eye: 1 s of idle loop, then the generated speech,
+    # with matching audio (silence over the idle tail) so the sync is visible too
+    import subprocess
+    import wave as wavmod
+
+    tail = 25
+    mux_wav = work / "mux.wav"
+    with wavmod.open(str(mux_wav), "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr)
+        pad = np.zeros(tail * sr // fps, dtype=np.float32)
+        w.writeframes((np.clip(np.concatenate([pad, speech]), -1, 1) * 32767).astype(np.int16).tobytes())
+    clips = {}
+    for name, frames in out.items():
+        silent = work / f"{name}_silent.mp4"
+        _write_mp4(silent, np.concatenate([idle[-tail:], frames]), fps)
+        final = work / f"{name}.mp4"
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(silent), "-i", str(mux_wav),
+                        "-c:v", "copy", "-c:a", "aac", "-shortest", str(final)], check=True)
+        clips[name] = final.read_bytes()
+
     res["seconds"] = round(time.time() - t0, 1)
     print("RESULT " + json.dumps(res), flush=True)
     return {"metrics": res, "strips": strips, "idle_loop_mp4": loop_mp4.read_bytes(),
-            "speech_mp4": _write_mp4(work / "speech_B.mp4", np.concatenate([idle[-25:], out["B_h264_file"]]), fps)}
+            "clips": clips, "handoff_frame": tail}
 
 
 def _write_mp4(path: pathlib.Path, frames, fps: int) -> bytes:
@@ -1318,7 +1338,18 @@ def seam(image: str = "inputs/newscaster.png", audio: str = "inputs/korean_flash
     for name, data in r["strips"].items():
         (d / f"strip_{name}.png").write_bytes(data)
     (d / "idle_loop.mp4").write_bytes(r["idle_loop_mp4"])
-    (d / "handoff_B.mp4").write_bytes(r["speech_mp4"])
+    for name, data in r["clips"].items():
+        (d / f"handoff_{name}.mp4").write_bytes(data)
+    # 나란히 비교용 (왼쪽부터 C 대조군 · A uint8 · B h264)
+    import subprocess as _sp
+
+    order = ["C_control_float", "A_uint8_memory", "B_h264_file"]
+    _sp.run(["ffmpeg", "-y", "-loglevel", "error",
+             *sum(([" -i".strip(), str(d / f"handoff_{n}.mp4")] for n in order), []),
+             "-filter_complex", "[0:v][1:v][2:v]hstack=inputs=3[v]",
+             "-map", "[v]", "-map", "0:a", "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p",
+             "-c:a", "aac", "-shortest", str(d / "handoff_CAB_side_by_side.mp4")], check=True)
+    print(f"전환 시점: {r['handoff_frame']}번째 프레임 ({r['handoff_frame']/25:.1f}초)")
     m = r["metrics"]
     print(f"\nh264 왕복 손실(MAD): {m['h264_roundtrip_mad']}   대기 루프 프레임 간 변화: {m['intra_frame_mad_idle']}")
     for name, c in m["conditions"].items():
