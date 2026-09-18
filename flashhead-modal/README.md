@@ -102,6 +102,40 @@ Pro는 스트리밍 재생이 불가(재생보다 7–8배 느림). 쓸 곳은 "
 
 가중치 로딩 시간이 호스트에 따라 3배 차이 나는 것은 Volume 캐시 상태 때문. 생성 자체는 전체의 몇 %라서 GPU를 올려도 의미 없다.
 
+## 호스트 갈아타기 (2026-09-18)
+
+Modal 이 어댑터로 밀려났다. 렌더러 본체는 클라우드 SDK 를 import 하지 않는다.
+
+```
+renderer.py    RendererCore — 파이프라인·스케줄러·대기 루프·HLS. modal 없음
+               Host          호스트가 제공하는 것 전부: put / get_many /
+                             publish_ready / commit — 네 개뿐이다
+               LocalHost     한 박스용 구현. 드라이버가 같은 프로세스에 있으니
+                             "전송"은 queue.Queue 다
+app.py         Modal 어댑터 — ModalHost 가 저 네 개를 Queue/Dict/Volume 에 얹고,
+               @app.cls 는 합성으로 코어에 위임한다
+run_local.py   평범한 프로세스. Lightning·RunPod·vast.ai·Lambda·책상 밑 박스 공통
+Dockerfile     이식 가능한 환경 정의 (Modal 이미지 체인과 나란히 유지)
+setup.sh       Docker 를 못 쓰는 박스용 — 같은 단계를 호스트 파이썬에 적용
+```
+
+Modal 만 예외이고 나머지 호스트는 전부 "GPU 달린 리눅스 박스"라 같은 타깃이다.
+그래서 다음 클라우드로 옮기는 비용이 하루 반이 아니라 한 시간이다.
+
+```bash
+./setup.sh                                          # 또는 docker build -t flashhead .
+python run_local.py --fetch-weights                 # 한 번, 약 8 GB
+python run_local.py --sessions 6 --minutes 3 --gap-s 18
+```
+
+경로는 전부 환경변수로 뺐다 — `FLASHHEAD_SRC` / `_WEIGHTS` / `_CACHE` / `_WARMUP` /
+`_MAX_SESSIONS` / `_COMPILE` / `_GPU` / `_APP`.
+
+**아직 실측으로 확인 못 한 것**: 크레딧이 없어 Modal 배포도, GPU 박스 실행도 돌려보지
+못했다. 확인한 것은 네 모듈이 모두 import 되는 것, 코어에 modal 이 없는 것,
+LocalHost 왕복, 그리고 Dockerfile·setup.sh 의 sed 패치가 실제 상류 파일에서
+의도대로 도는 것(compile 플래그 양방향, 동기화 8개 제거 후 파싱 통과)까지다.
+
 ## H100 실험 (2026-09-17) — 동시 발화는 되지만 경제성은 L4가 낫다
 
 `FLASHHEAD_APP=flashhead-h100 FLASHHEAD_GPU=H100 FLASHHEAD_MAX_SESSIONS=16 modal deploy app.py`

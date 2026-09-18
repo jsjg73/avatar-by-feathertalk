@@ -52,7 +52,10 @@ JOBS_DIR = HERE / "jobs"
 JOBS_DIR.mkdir(exist_ok=True)
 
 # Import app.py for its constants and `tail_progress` without triggering a
-# deploy — module import only builds the Image *definition*.
+# deploy — module import only builds the Image *definition*. app.py imports the
+# host-free core beside it, so that directory has to be importable from here.
+if str(APP_PY.parent) not in sys.path:
+    sys.path.insert(0, str(APP_PY.parent))
 _spec = importlib.util.spec_from_file_location("flashhead_app", APP_PY)
 fh = importlib.util.module_from_spec(_spec)
 assert _spec.loader is not None
