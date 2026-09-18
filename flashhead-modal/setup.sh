@@ -24,7 +24,28 @@ say() { printf '\n== %s\n' "$1"; }
 say "점검"
 command -v git >/dev/null || { echo "git 이 없습니다"; exit 1; }
 command -v ffmpeg >/dev/null || { echo "ffmpeg 이 없습니다 (apt-get install -y ffmpeg)"; exit 1; }
-"$PY" -c 'import sys; assert sys.version_info >= (3,10), sys.version' || exit 1
+# Python 3.11 exactly. Upstream pins mediapipe==0.10.9 (face crop), whose last
+# wheels are for 3.11 — on 3.12 pip offers 0.10.13+ instead, and taking a newer
+# mediapipe would change the crop and so the rendered frames, which makes the
+# numbers incomparable with earlier runs. Modal's image is 3.11 for the same
+# reason. If the box's default is something else, build a 3.11 env and point
+# PYTHON at it:  uv venv ~/py311 --python 3.11 && PYTHON=~/py311/bin/python ./setup.sh
+"$PY" - <<'EOF' || exit 1
+import sys
+v = sys.version_info
+if (v.major, v.minor) != (3, 11):
+    sys.exit(f"python 3.11 이 필요합니다 (지금 {v.major}.{v.minor}). "
+             "mediapipe==0.10.9 휠이 3.11 까지만 있습니다.\n"
+             "  uv venv ~/py311 --python 3.11 && PYTHON=~/py311/bin/python ./setup.sh")
+print("python", sys.version.split()[0], "OK")
+EOF
+# `uv venv` does not seed pip, and every install step below goes through it.
+"$PY" -m pip --version >/dev/null 2>&1 || {
+  echo "pip 이 없어 ensurepip 로 넣습니다"
+  "$PY" -m ensurepip --upgrade >/dev/null 2>&1 \
+    || { echo "pip 설치 실패 — 'uv venv --seed' 로 환경을 다시 만드세요"; exit 1; }
+}
+
 if command -v nvidia-smi >/dev/null; then
   nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
 else
@@ -54,7 +75,20 @@ EOF
 
 say "flash-attn (있으면 빠르고, 없으면 SDPA 로 떨어진다)"
 "$PY" -m pip install --no-cache-dir flash_attn==2.8.0.post2 --no-build-isolation \
-    || echo "flash_attn 빌드 실패 — SDPA 로 동작합니다 (기동 로그에 어떤 커널을 썼는지 찍힙니다)"
+    || echo "flash_attn 설치 실패 — SDPA 로 동작합니다"
+# Installing is not the same as working. A wheel built against a different
+# libtorch loads as an ImportError ("undefined symbol: ...") — and upstream
+# guards its import with `except ModuleNotFoundError`, which does not catch that,
+# so a half-installed flash_attn takes the whole pipeline down at import. If it
+# cannot be imported, remove it so the guard sees a clean absence and falls back.
+if "$PY" -m pip show flash_attn >/dev/null 2>&1; then
+  if "$PY" -c 'import flash_attn' 2>/dev/null; then
+    echo "flash_attn import OK"
+  else
+    echo "flash_attn 이 설치됐지만 import 되지 않습니다 (torch 와 ABI 불일치) — 제거하고 SDPA 로 갑니다"
+    "$PY" -m pip uninstall -y flash_attn >/dev/null 2>&1
+  fi
+fi
 
 PIPE="$SRC/flash_head/src/pipeline/flash_head_pipeline.py"
 
