@@ -42,6 +42,15 @@ CKPT = f"{WEIGHTS}/SoulX-FlashHead-1_3B"
 WAV2VEC = f"{WEIGHTS}/wav2vec2-base-960h"
 GPU = os.environ.get("FLASHHEAD_GPU", "L4")
 COMPILE = os.environ.get("FLASHHEAD_COMPILE", "0") == "1"
+# Per-stage timing inside a batched generate. Off by default: it needs a
+# cuda.synchronize between stages, which is the very thing stripped from
+# upstream for costing a slot 8 stalls per chunk.
+STAGE_TIMING = os.environ.get("FLASHHEAD_STAGE_TIMING", "0") == "1"
+# Decompose the residency cost — what one live session adds to a slot whether
+# or not it speaks. Capacity is (slot - fixed) / (residency + speech x duty),
+# and at a 17% duty the residency term is weighted six times heavier, so this
+# is the number to know. Off by default; it adds a perf_counter per section.
+RESIDENCY_TIMING = os.environ.get("FLASHHEAD_RESIDENCY_TIMING", "0") == "1"
 DONE_MARK = "__done__"
 
 
@@ -214,6 +223,38 @@ class _HlsShipper:
         self.flush()
         self.q.put(None)
         self.thread.join(timeout=120)
+
+
+class _AudioWindow:
+    """The rolling audio window a chunk is conditioned on, as one float32 array.
+
+    It used to be a `deque` of 128,000 Python floats: every slot turned a numpy
+    chunk into 15,360 float objects to append, and every speaking slot turned the
+    whole deque back into an array. Both directions were pure Python and held the
+    GIL, on the one thread that drives every session.
+
+    Writes advance a cursor in a doubled buffer so the live window is always one
+    contiguous slice — no copy to read, no allocation to write.
+    """
+
+    def __init__(self, size: int):
+        import numpy as np
+
+        self.n = size
+        self._buf = np.zeros(size * 2, dtype=np.float32)
+        self._pos = size                      # window is _buf[_pos - n : _pos]
+
+    def push(self, pcm) -> None:
+        k = len(pcm)
+        if self._pos + k > len(self._buf):    # wrap: carry the live window to the front
+            self._buf[: self.n] = self._buf[self._pos - self.n : self._pos]
+            self._pos = self.n
+        self._buf[self._pos : self._pos + k] = pcm
+        self._pos += k
+
+    def view(self):
+        """The current window. A view — the caller must not write into it."""
+        return self._buf[self._pos - self.n : self._pos]
 
 
 def _loop_window(loop, pos: int, n: int):
@@ -439,6 +480,9 @@ class RendererCore:
         # is fitted from these because with batching the cost is no longer
         # proportional to the number of speakers
         self.batch_samples = deque(maxlen=200)
+        self.res_t: dict = {}      # residency seconds by section
+        self.res_n = 0             # session-slots those seconds cover
+        self.res_slots = 0
         batched = _enable_batching()
         ready_key = f"ready:{self.model_type}"
 
@@ -548,6 +592,36 @@ class RendererCore:
         self.gen_ema = 0.9 * self.gen_ema + 0.1 * gen if self.gen_ema else gen
         return frames, gen, t0 - w0
 
+    def _audio_embed_batch(self, windows: list, start_idx: int, end_idx: int):
+        """`get_audio_embedding` for several sessions at once.
+
+        Upstream runs wav2vec one session at a time — `preprocess_audio` does
+        `unsqueeze(0)` on the way in and `squeeze(0)` on the way out — so a slot
+        with eight speakers paid eight forwards. The encoder itself is batch
+        native; only the wrapper was not. This was 58% of what a session costs the
+        scheduler in a slot, the single largest item after generation itself.
+
+        Every window is the same length, so nothing has to be padded.
+        """
+        import numpy as np
+        import torch
+        from einops import rearrange
+
+        from flash_head.inference import infer_params
+
+        pl = self.pipeline
+        sr, fps = infer_params["sample_rate"], infer_params["tgt_fps"]
+        feats = pl.wav2vec_feature_extractor(list(windows), sampling_rate=sr).input_values
+        feat = torch.as_tensor(np.asarray(feats, dtype=np.float32), device=pl.device)
+        with torch.no_grad():
+            out = pl.audio_encoder(feat, seq_len=int(len(windows[0]) * fps / sr),
+                                   output_hidden_states=True)
+        emb = rearrange(torch.stack(out.hidden_states[1:], dim=1), "b l s d -> b s l d")
+
+        # the same five-frame window upstream takes around each frame
+        idx = (torch.arange(2 * 2 + 1) - 2).unsqueeze(0) + torch.arange(start_idx, end_idx).unsqueeze(1)
+        return emb[:, torch.clamp(idx, min=0, max=end_idx - 1)].contiguous()
+
     def _generate_batch(self, sessions: list, embs: list):
         """`FlashHeadPipeline.generate` for several sessions at once.
 
@@ -571,9 +645,23 @@ class RendererCore:
         motion = torch.stack([s["motion"] if s.get("motion") is not None
                               else pl.ref_img_latent_dict[s["avatar"]][:, :1] for s in sessions])
         ref = torch.stack([pl.ref_img_latent_dict[s["avatar"]] for s in sessions])
-        ctx = torch.cat([e.to(pl.device) for e in embs], dim=0)
+        # embs is either the slot's batched context (B, ...) or one tensor per
+        # session, which is what the single-session callers still hand over
+        ctx = (embs.to(pl.device) if torch.is_tensor(embs)
+               else torch.cat([e.to(pl.device) for e in embs], dim=0))
         ts, n_ts = pl.timesteps, pl.num_timesteps
 
+        stage: dict = {}
+
+        def mark(name: str, t0: float) -> float:
+            if not STAGE_TIMING:
+                return 0.0
+            torch.cuda.synchronize()
+            now = time.time()
+            stage[name] = stage.get(name, 0.0) + now - t0
+            return now
+
+        t = time.time() if STAGE_TIMING else 0.0
         with torch.no_grad():
             for i in range(len(ts) - 1):
                 x[:, :, :motion.shape[2]] = motion
@@ -588,21 +676,28 @@ class RendererCore:
                     [torch.randn(shape, dtype=pl.param_dtype, device=pl.device,
                                  generator=s["generator"]) for s in sessions])
             x[:, :, :motion.shape[2]] = motion
+            t = mark("denoise", t)
 
             # LtxVAE.decode adds a batch dim of its own; feed it one instead
             videos = pl.vae.model.decode(pl.vae.un_normalize_latents(x),
                                          return_dict=False, target_shape=x.shape)[0]
+            t = mark("decode", t)
             if pl.color_correction_strength > 0.0:
                 # already batched upstream (B, C, T, H, W) against (B, C, 1, H, W)
                 refimg = torch.stack([pl.cond_image_tensor_dict[s["avatar"]][0] for s in sessions])
                 videos = match_and_blend_colors_torch(videos, refimg, pl.color_correction_strength)
+            t = mark("color", t)
             cond = videos[:, :, -pl.motion_frames_num:].to(pl.device)
             new_motion = pl.vae.normalize_latents(
                 pl.vae.model.encode(cond, return_dict=False)[0].sample())
+            t = mark("motion", t)
 
         # run_pipeline's tail, with the batch kept: (B,C,F,H,W) -> (B,F,H,W,C)
         frames = (((videos.to(torch.float32) + 1) / 2).permute(0, 2, 3, 4, 1).clip(0, 1) * 255)
         frames = frames[:, pl.motion_frames_num:].contiguous().to(torch.uint8).cpu().numpy()
+        mark("transfer", t)
+        if STAGE_TIMING:
+            self.stage_last = stage
         return frames, new_motion
 
     def _run_batch(self, sessions: list, embs: list) -> dict:
@@ -904,7 +999,7 @@ class RendererCore:
             "slice_len": slice_len, "chunk_samples": slice_len * sr // fps, "chunk_s": slice_len / fps,
             "audio_end_idx": p["cached_audio_duration"] * fps,
             "audio_start_idx": p["cached_audio_duration"] * fps - frame_num,
-            "audio_dq": deque([0.0] * cached, maxlen=cached),
+            "audio_dq": _AudioWindow(cached),
             "pending": deque(), "buf": np.zeros(0, dtype=np.float32),
             "fade_frames": fade_frames, "idle_timeout_s": idle_timeout_s, "max_seconds": max_seconds,
             "speaking": False, "loop_pos": 0, "last_frame": None, "want_since": None,
@@ -1059,7 +1154,11 @@ class RendererCore:
             talking = [s for s in live if prep.get(s["id"], {}).get("emb") is not None]
             if talking:
                 try:
-                    out = self._run_batch(talking, [prep[s["id"]]["emb"] for s in talking])
+                    # one wav2vec forward for the whole slot, then one generate
+                    embs = self._audio_embed_batch([prep[s["id"]]["emb"] for s in talking],
+                                                   talking[0]["audio_start_idx"],
+                                                   talking[0]["audio_end_idx"])
+                    out = self._run_batch(talking, embs)
                     for sid, r in out.items():
                         prep[sid].update(r)
                 except Exception as exc:  # noqa: BLE001
@@ -1075,6 +1174,31 @@ class RendererCore:
                     self._emit(s, p, behind, now)
                 except Exception as exc:  # noqa: BLE001
                     failed(s, exc)
+
+            if RESIDENCY_TIMING:
+                self.res_slots += 1
+                if self.res_slots % 100 == 0 and self.res_n:
+                    # Diagnostics must never take down what they measure. A timer
+                    # variable once collided with a tensor named `t` and the
+                    # formatting raised, which killed this thread and with it every
+                    # session — the run looked like a hang, not a bug in a print.
+                    try:
+                        per = {k: float(v) / self.res_n for k, v in sorted(self.res_t.items())}
+                        tot = sum(per.values())
+                        print(f"residency over {self.res_slots} slots, {len(live)} live: "
+                              f"{tot*1000:.2f} ms per session-slot  "
+                              + "  ".join(f"{k.split(':')[-1]} {v*1000:.2f}" for k, v in per.items()),
+                              flush=True)
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"residency report failed: {type(exc).__name__}: {exc}", flush=True)
+
+    def _res(self, name: str, t0: float) -> float:
+        """Charge the time since `t0` to a residency section. Returns the new mark."""
+        if not RESIDENCY_TIMING:
+            return 0.0
+        now = time.perf_counter()
+        self.res_t[name] = self.res_t.get(name, 0.0) + now - t0
+        return now
 
     def _slot_prep(self, sess: dict, may_speak: bool, now: float):
         """Take one session as far as it can go without the GPU.
@@ -1101,6 +1225,7 @@ class RendererCore:
         if now - sess["t0"] > sess["max_seconds"]:
             sess["reason"] = "max_seconds"; sess["open"] = False; sess["done"].set(); return None
 
+        _rt = time.perf_counter() if RESIDENCY_TIMING else 0.0
         is_speech = bool(sess["pending"]) and may_speak
         deferred = False
         if is_speech:
@@ -1117,7 +1242,9 @@ class RendererCore:
             deferred = bool(sess["pending"])
             if deferred:
                 st["deferred_chunks"] += 1
-        sess["audio_dq"].extend(pcm.tolist())       # the 8 s window advances either way
+        _rt = self._res("prep:decide", _rt)
+        sess["audio_dq"].push(pcm)                  # the 8 s window advances either way
+        _rt = self._res("prep:audio_window", _rt)
 
         emb = None
         if is_speech or sess["idle_loop"] is None:
@@ -1133,8 +1260,10 @@ class RendererCore:
                                                                         dtype=self.pipeline.param_dtype)
                     sess["motion"] = self.pipeline.vae.encode(((t / 255 - 0.5) * 2).permute(3, 0, 1, 2).unsqueeze(0))
                 sess["speaking"] = True
-            emb = get_audio_embedding(self.pipeline, np.array(sess["audio_dq"], dtype=np.float32),
-                                      sess["audio_start_idx"], sess["audio_end_idx"])
+                _rt = self._res("prep:motion_inject", _rt)
+            emb = sess["audio_dq"].view()          # embedded with the rest of the slot
+            _rt = self._res("prep:window", _rt)
+        self.res_n += 1 if RESIDENCY_TIMING else 0
         return {"pcm": pcm, "is_speech": is_speech, "deferred": deferred, "emb": emb,
                 "frames": None, "gen": 0.0}
 
@@ -1143,6 +1272,7 @@ class RendererCore:
         import numpy as np
 
         st = sess["stats"]
+        _rt = time.perf_counter() if RESIDENCY_TIMING else 0.0
         is_speech, frames, gen = p["is_speech"], p["frames"], p["gen"]
         if frames is None:                       # not generating: play the idle loop
             loop = sess["idle_loop"]
@@ -1158,21 +1288,26 @@ class RendererCore:
         else:
             st["gen_s"].append(round(gen, 3))
 
+        _rt = self._res("emit:frames", _rt)
         sess["vq"].put(frames)
         sess["last_frame"] = frames[-1]
         sess["aq"].put((np.clip(p["pcm"], -1.0, 1.0) * 32767).astype(np.int16).tobytes())
+        _rt = self._res("emit:queues", _rt)
         sess["k"] += 1
         st["chunks"] = sess["k"]
         st["speech_chunks"] += int(is_speech)
         st["gpu_chunks"] += int(p["frames"] is not None)
         st["behind_s"].append(round(behind, 2))
+        _rt = self._res("emit:stats", _rt)
         sess["ship"].ship_new_files()
+        _rt = self._res("emit:ship_files", _rt)
         kind = "speech" if is_speech else ("deferred" if p["deferred"] else "silence")
         # every speech and every deferred chunk is logged: the studio reconstructs
         # the Gantt's spans from these lines, so a skipped one is a hole in the chart
         if kind != "silence" or sess["k"] % 20 == 0:
             sess["ship"].log(f"live: chunk {sess['k']} {kind} "
                              f"gen {gen:.2f}s behind {behind:.2f}s queued {len(sess['pending'])*sess['chunk_s']:.1f}s")
+        self._res("emit:log", _rt)
 
     def _close_live(self, sess: dict) -> dict:
         sess["open"] = False
