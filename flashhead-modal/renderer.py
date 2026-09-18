@@ -216,6 +216,26 @@ class _HlsShipper:
         self.thread.join(timeout=120)
 
 
+def _loop_window(loop, pos: int, n: int):
+    """`n` frames of `loop` starting at `pos` — a view unless the window wraps.
+
+    This runs on the scheduler thread for every listening session in every 0.96 s
+    slot, and one chunk is 24 × 512 × 512 × 3 = 18.9 MB. `np.take` always copies,
+    so the container spent that bandwidth on frames it already had. A slice of a
+    C-contiguous array costs nothing, and only the wrap — once per loop cycle,
+    about one slot in ten — has to concatenate.
+
+    The result may alias `loop`, so callers must not write into it. The one that
+    does (the fade back into the loop) copies first.
+    """
+    import numpy as np
+
+    end = pos + n
+    if end <= len(loop):
+        return loop[pos:end]
+    return np.concatenate((loop[pos:], loop[:end - len(loop)]))
+
+
 def _live_ffmpeg(hls: pathlib.Path, width: int, height: int, fps: int, sr: int, audio_fifo: str, slice_len: int):
     """Long-lived HLS encoder for a live session: raw frames on stdin, raw PCM on a FIFO."""
     import subprocess
@@ -725,9 +745,16 @@ class RendererCore:
         aq: _q.Queue = _q.Queue()
 
         def vwriter() -> None:
+            # `tobytes()` copied the whole 18.9 MB chunk again just to hand it to
+            # a pipe, and held the GIL while doing it — stealing from the scheduler
+            # thread as well as costing bandwidth. Idle frames arrive as views of
+            # the shared loop, which are contiguous; the few that are not are made
+            # so here.
             try:
                 while (arr := vq.get()) is not None:
-                    proc.stdin.write(arr.tobytes())
+                    if not arr.flags["C_CONTIGUOUS"]:
+                        arr = np.ascontiguousarray(arr)
+                    proc.stdin.write(memoryview(arr).cast("B"))
             finally:
                 proc.stdin.close()
 
@@ -873,8 +900,7 @@ class RendererCore:
 
         loop = sess["idle_loop"]
         if loop is not None and not is_speech:
-            frames = np.take(loop, range(sess["loop_pos"], sess["loop_pos"] + sess["slice_len"]),
-                             axis=0, mode="wrap")
+            frames = _loop_window(loop, sess["loop_pos"], sess["slice_len"])
             sess["loop_pos"] = (sess["loop_pos"] + sess["slice_len"]) % len(loop)
             if sess["speaking"]:                    # returning from a turn: fade into the loop
                 f = sess["fade_frames"]
@@ -887,8 +913,8 @@ class RendererCore:
         else:
             if loop is not None and not sess["speaking"]:
                 # entering generation: continue from the frames the viewer is seeing
-                seen = np.take(loop, range(sess["loop_pos"] - sess["motion_n"], sess["loop_pos"]),
-                               axis=0, mode="wrap")
+                seen = _loop_window(loop, (sess["loop_pos"] - sess["motion_n"]) % len(loop),
+                                    sess["motion_n"])
                 import torch
 
                 with self.gpu_lock:
