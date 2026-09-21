@@ -261,8 +261,9 @@ def _loop_window(loop, pos: int, n: int):
     """`n` frames of `loop` starting at `pos` — a view unless the window wraps.
 
     This runs on the scheduler thread for every listening session in every 0.96 s
-    slot, and one chunk is 24 × 512 × 512 × 3 = 18.9 MB. `np.take` always copies,
-    so the container spent that bandwidth on frames it already had. A slice of a
+    slot, and one chunk is 24 × 512 × 512 × 3 = 18.9 MB. `np.take` always copies:
+    at eight sessions that was 158 MB/s of pure memcpy on a single thread, which
+    capped the container at ~8 sessions while the GPU sat idle. A slice of a
     C-contiguous array costs nothing, and only the wrap — once per loop cycle,
     about one slot in ten — has to concatenate.
 
@@ -1021,10 +1022,10 @@ class RendererCore:
 
         def vwriter() -> None:
             # `tobytes()` copied the whole 18.9 MB chunk again just to hand it to
-            # a pipe, and held the GIL while doing it — stealing from the scheduler
-            # thread as well as costing bandwidth. Idle frames arrive as views of
-            # the shared loop, which are contiguous; the few that are not are made
-            # so here.
+            # a pipe. Writing the array's own buffer skips that; the copy held the
+            # GIL, so it was stealing from the scheduler thread as well as costing
+            # bandwidth. Idle frames arrive as views of the shared loop, which are
+            # contiguous, and the few that are not get made so here.
             try:
                 while (arr := vq.get()) is not None:
                     if not arr.flags["C_CONTIGUOUS"]:
@@ -1111,8 +1112,14 @@ class RendererCore:
             # the first once the real 0.8 s landed a slot later.
             budget = self._batch_budget(chunk_s)
             speakers = [s for s in live if s["pending"]]
+            # want_since marks the start of a TURN, not of a chunk. A session that is
+            # already speaking has had its want_since cleared, and must not set it
+            # again mid-utterance: every later chunk of that utterance would then
+            # record a zero wait and dilute freeze-out — the fraction of turns that
+            # could not start at once — until it means nothing. The transition being
+            # timed is silence -> speech, which happens once per turn.
             for s in speakers:
-                if s["want_since"] is None:
+                if s["want_since"] is None and not s["speaking"]:
                     s["want_since"] = now
             # A session mid-utterance is never cut: once speech is being played
             # out there is no slack in its audio timeline, so a missed slot shows
@@ -1323,8 +1330,14 @@ class RendererCore:
                  f"GPU {st['gpu_chunks']} chunks ({saved:.0f}% saved), {ship.streamed/1e6:.1f} MB")
         ship.close()
         gens = sorted(st["gen_s"])
-        waits = st["wait_to_speak_s"]
+        waits = st["wait_to_speak_s"]          # one entry per turn (see _scheduler_loop)
         tail = st["behind_s"][-20:]
+        # freeze-out: the share of turns the avatar could not begin at once because
+        # no budget was free. TASI's name and TASI's design target (0.5%). A turn is
+        # counted as frozen once it waits more than a hundredth of a slot, which is
+        # below anything a viewer could see and above scheduler jitter.
+        turns = len(waits)
+        frozen = [w for w in waits if w > 0.01]
         out = {"chunks": st["chunks"], "speech_chunks": st["speech_chunks"], "gpu_chunks": st["gpu_chunks"],
                "gpu_chunk_ratio": round(st["gpu_chunks"] / k, 3), "deferred_chunks": st["deferred_chunks"],
                "gen_median_s": gens[len(gens) // 2] if gens else None,
@@ -1333,7 +1346,16 @@ class RendererCore:
                "behind_max_s": max(st["behind_s"]) if st["behind_s"] else None,
                "behind_tail_s": max(tail) if tail else None,
                "wait_to_speak_max_s": max(waits) if waits else 0.0,
-               "wait_to_speak_median_s": sorted(waits)[len(waits) // 2] if waits else 0.0,
+               "wait_to_speak_median_s": _pct(waits, 50),
+               # Exact GPU seconds, not a count times an average. `_run_batch`
+               # gives the whole slot's time to the first session of the batch
+               # and 0.0 to the rest, so summing these over every session counts
+               # each slot once — which is what occupancy needs.
+               "gpu_seconds": round(sum(st["gen_s"]), 2),
+               "turns": turns, "turns_frozen": len(frozen),
+               "freeze_out": round(len(frozen) / turns, 4) if turns else 0.0,
+               "wait_p50_s": _pct(waits, 50), "wait_p95_s": _pct(waits, 95),
+               "wait_frozen_mean_s": round(sum(frozen) / len(frozen), 2) if frozen else 0.0,
                "ended_by": sess["reason"], "ffmpeg_rc": rc, "slot_overruns": self.slot_overruns - sess["overruns_at_open"],
                "slot_budget": self.slot_budget, "slot_speakers": list(self.slot_hist),
                "peer_sessions": len(self.live_sessions) - 1,
@@ -1569,6 +1591,60 @@ class RendererCore:
                 pass
 
 
+def _pct(xs: list, q: int) -> float:
+    """q-th percentile, nearest-rank. Small samples are the norm here (a session
+    holds a few dozen turns), so an interpolating definition would invent values
+    between measurements that never happened."""
+    if not xs:
+        return 0.0
+    s = sorted(xs)
+    return s[min(len(s) - 1, max(0, (q * len(s) + 99) // 100 - 1))]
+
+
+# The three gates that decide whether a session count "works". All three must
+# hold: a run can keep video realtime (gate 3) while freezing a third of the
+# avatar's turns (gate 1), which is the failure this whole experiment is for.
+GATES = {"freeze_out": 0.01, "wait_p95_s": 0.5, "behind_tail_s": 0.5}
+
+
+def verdict(results: dict) -> dict:
+    """Aggregate a run to the numbers the gates are read from, worst session wins."""
+    ok = [r for r in results.values() if "error" not in r]
+    if not ok:
+        return {"pass": False, "reason": "every session errored"}
+    turns = sum(r.get("turns", 0) for r in ok)
+    frozen = sum(r.get("turns_frozen", 0) for r in ok)
+    agg = {
+        "sessions": len(results),
+        "errors": len(results) - len(ok),
+        "turns": turns,
+        "turns_frozen": frozen,
+        # run-wide, not the mean of per-session rates: a session with three turns
+        # must not weigh the same as one with forty
+        "freeze_out": round(frozen / turns, 4) if turns else 0.0,
+        "wait_p95_s": max((r.get("wait_p95_s", 0.0) for r in ok), default=0.0),
+        "wait_max_s": max((r.get("wait_to_speak_max_s", 0.0) for r in ok), default=0.0),
+        "behind_tail_s": max((r.get("behind_tail_s") or 0.0 for r in ok), default=0.0),
+        "gen_median_s": _pct([r["gen_median_s"] for r in ok if r.get("gen_median_s")], 50),
+        "slot_budget": max((r.get("slot_budget", 0) for r in ok), default=0),
+        "slot_overruns": max((r.get("slot_overruns", 0) for r in ok), default=0),
+    }
+    failed = [k for k, lim in GATES.items() if agg.get(k, 0) > lim]
+    agg["pass"] = not failed and not agg["errors"]
+    agg["failed_gates"] = failed
+    return agg
+
+
+def verdict_line(results: dict) -> str:
+    v = verdict(results)
+    mark = "PASS" if v.get("pass") else "FAIL"
+    if "reason" in v:
+        return f"  판정: FAIL — {v['reason']}"
+    return (f"  판정: {mark} — freeze-out {v['freeze_out']*100:.1f}% (한계 1%) · "
+            f"대기 p95 {v['wait_p95_s']}s (한계 0.5s) · 영상 지연 끝 {v['behind_tail_s']}s (한계 0.5s)"
+            + (f" · 불합격 게이트: {', '.join(v['failed_gates'])}" if v["failed_gates"] else ""))
+
+
 def print_summary(results: dict) -> None:
     """Report a multi-session run. Shared by the Modal entrypoint and the
     plain-process harness so both read the same way."""
@@ -1581,8 +1657,10 @@ def print_summary(results: dict) -> None:
         tot_chunks += r["chunks"]; tot_gpu += r["gpu_chunks"]
         print(f"  {i+1}: 청크 {r['chunks']:4d} · GPU {r['gpu_chunks']:3d} ({r['gpu_chunk_ratio']*100:.0f}%) · "
               f"생성 {r['gen_median_s']}s · 영상 지연 최대 {r['behind_max_s']}s / 끝 {r['behind_tail_s']}s · "
-              f"발화 대기 중앙 {r['wait_to_speak_median_s']}s / 최대 {r['wait_to_speak_max_s']}s "
-              f"({r['deferred_chunks']}청크 양보) · 동거 {r['peer_sessions']}")
+              f"턴 {r.get('turns', 0)} 중 {r.get('turns_frozen', 0)} 밀림 "
+              f"(freeze-out {r.get('freeze_out', 0)*100:.1f}%) · "
+              f"대기 p50 {r.get('wait_p50_s', 0)}s / p95 {r.get('wait_p95_s', 0)}s / 최대 {r['wait_to_speak_max_s']}s "
+              f"· 동거 {r['peer_sessions']}")
         print(f"     생성 분해: 상태교체 {r.get('gen_swap_s')}s + 모델 {r.get('gen_pipe_s')}s "
               f"+ 호스트전송 {r.get('gen_xfer_s')}s")
     if tot_chunks:
@@ -1592,13 +1670,17 @@ def print_summary(results: dict) -> None:
         print(f"  영상 청크 {tot_chunks} (= {tot_chunks*0.96/60:.1f}분 분량) · GPU 청크 {tot_gpu} "
               f"({tot_gpu/tot_chunks*100:.0f}%) · GPU가 만든 시간 {tot_gpu*0.96/60:.1f}분")
         print(f"  실시간 유지: 세션 길이가 요구하는 청크 {span/0.96:.0f} vs 실제 {[r['chunks'] for r in ok]}")
-        # occupancy is GPU seconds over wall seconds, so it needs the measured chunk
-        # time of this card — not the 0.82 s an L4 once took. With a budget above 1
-        # the old constant read over 100%, which is not a thing GPU time can do.
+        # occupancy is GPU seconds over wall seconds. The previous form multiplied
+        # a per-SESSION chunk count by a per-SLOT batch time, so every slot with
+        # more than one speaker was counted as many times as it had speakers: at
+        # 16 sessions it printed 210%, which is not a thing GPU time can do. An
+        # earlier pass fixed the constant it used and left the unit mismatch.
         gens = sorted(r["gen_median_s"] for r in ok if r.get("gen_median_s"))
         gen = gens[len(gens) // 2] if gens else 0.0
-        print(f"  GPU 점유율 {sum(r['gpu_chunks'] for r in ok)*gen/span*100:.0f}% "
+        busy = sum(r.get("gpu_seconds") or 0.0 for r in ok)
+        print(f"  GPU 점유율 {busy/span*100:.0f}% "
               f"(청크 {gen:.3f}s 기준) · 세션당 GPU 비용은 {len(results)}분의 1")
+        print(verdict_line(results))
         # the histogram is container-wide, so any session's copy is the whole run's
         hist = next((r.get("slot_speakers") for r in ok if r.get("slot_speakers")), None)
         if hist:
