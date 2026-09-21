@@ -329,8 +329,9 @@ class VastProvider(Provider):
             if not k:
                 raise RuntimeError("API 키가 없습니다")
             headers["Authorization"] = f"Bearer {k}"
-        req = urllib.request.Request(f"{self.API}/{path.lstrip('/')}", data=data,
-                                     headers=headers, method=method)
+        url = (f"https://console.vast.ai/api/{path[3:]}" if path.startswith("../")
+               else f"{self.API}/{path.lstrip('/')}")
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
             with urllib.request.urlopen(req, timeout=120) as r:
                 return json.loads(r.read() or b"{}")
@@ -425,8 +426,26 @@ class VastProvider(Provider):
         u = self._api("users/current/")
         return float(u.get("credit") or 0.0), float(u.get("balance") or 0.0)
 
+    def _instances(self) -> list[dict]:
+        """Every instance on the account, following the pages.
+
+        `/api/v0/instances/` answers 410 now; only this path moved to v1, while
+        users/ssh/bundles are still v0. And v1 pages — a sweep that reads one
+        page and stops is the same bug as a sweep that looks up two names.
+        """
+        rows, token, guard = [], None, 0
+        while guard < 50:
+            guard += 1
+            path = "../v1/instances/" + (f"?next_token={token}" if token else "")
+            r = self._api(path)
+            rows += r.get("instances") or []
+            token = r.get("next_token")
+            if not token:
+                break
+        return rows
+
     def list(self) -> list[Box]:
-        rows = self._api("instances/").get("instances") or []
+        rows = self._instances()
         boxes = []
         for i in rows:
             st = (i.get("actual_status") or i.get("cur_state") or "unknown").lower()
@@ -488,7 +507,18 @@ class VastProvider(Provider):
             offer = found[0]["id"]
             pick = found[0]
         else:
-            pick = {"id": offer, "gpu_name": kind, "geolocation": "?", "dph_total": 0.0}
+            # Look the pinned offer up rather than inventing a placeholder: the
+            # price printed back must be the price about to be charged.
+            import urllib.parse
+            import urllib.request
+            u = ("https://cloud.vast.ai/api/v0/bundles/?q="
+                 + urllib.parse.quote(json.dumps({"id": {"eq": offer}, "limit": 1})))
+            req = urllib.request.Request(u, headers={"Accept": "application/json",
+                                                     "User-Agent": "curl/8.7.1"})
+            with urllib.request.urlopen(req, timeout=60) as r:
+                got = json.load(r).get("offers") or []
+            pick = got[0] if got else {"id": offer, "gpu_name": kind,
+                                       "geolocation": "?", "dph_total": 0.0}
 
         body = {
             "client_id": "me", "image": image, "disk": float(disk),
@@ -515,16 +545,15 @@ class VastProvider(Provider):
             raise RuntimeError(r.get("msg") or str(r)[:300])
         iid = str(r.get("new_contract"))
 
-        # The key goes on after creation: `PUT /asks/` has no field for it, and
-        # attaching per instance avoids leaving a key on the account for boxes
-        # this project does not own.
+        # `PUT /asks/` has no field for a key, so it goes on the account. The
+        # per-instance attach would be narrower but it hangs off the retired v0
+        # instances path. Registering the same key twice is a no-op.
         try:
-            self._api(f"instances/{iid}/ssh/", "POST", {"ssh_key": pub})
-        except Exception:                             # noqa: BLE001
-            try:
+            if not any(pub.split()[1] in (k.get("public_key") or "")
+                       for k in (self._api("ssh/") or [])):
                 self._api("ssh/", "POST", {"ssh_key": pub})
-            except Exception as e:                    # noqa: BLE001
-                print(f"⚠ SSH 키 등록 실패 ({e}) — console.vast.ai 에서 직접 넣으세요")
+        except Exception as e:                        # noqa: BLE001
+            print(f"⚠ SSH 키 등록 실패 ({e}) — console.vast.ai 에서 직접 넣으세요")
 
         return Box(vendor=self.name, id=iid, name=name,
                    kind=f"1x {pick.get('gpu_name', kind)}", state="loading",
@@ -534,8 +563,7 @@ class VastProvider(Provider):
 
     def ssh(self, box: Box) -> tuple[str, int] | None:
         """(host, port) for a direct connection, once the box has one."""
-        i = box.handle or next((x for x in self._api("instances/").get("instances") or []
-                                if str(x["id"]) == box.id), None)
+        i = box.handle or next((x for x in self._instances() if str(x["id"]) == box.id), None)
         if not i:
             return None
         ports = i.get("ports") or {}
@@ -603,6 +631,9 @@ def show(boxes: list[Box], problems: list[tuple[str, str]]) -> None:
         print(f"● 지금 과금 중: {len(live)}개")
         for b in live:
             print(f"    python box.py stop {b.ref}")
+    elif problems:
+        print(f"● 확인된 범위에서는 과금 중인 것 없음 — 그러나 {len(problems)}개 벤더를 "
+              f"보지 못했습니다. '없음'이 아닙니다.")
     else:
         print("● 지금 과금 중인 것: 없음")
     for n, why in problems:
