@@ -55,6 +55,23 @@ RESIDENCY_TIMING = os.environ.get("FLASHHEAD_RESIDENCY_TIMING", "0") == "1"
 # the wait statistics. See _stats: a benchmark is observed from an empty system
 # and its first turns never queue, which biases every point optimistic.
 WARMUP_S = float(os.environ.get("FLASHHEAD_WARMUP_S", "90"))
+# How many chunks a session may generate ahead of what it is playing out.
+#
+# The audio for a turn arrives as a whole TTS file, so there is no reason to
+# generate it in lockstep with playback. Generating 0.96 s of video costs about
+# a quarter of a second of GPU, so an utterance needs ~1.8 s of GPU spread over
+# the 7 s it takes to say — but the lockstep scheduler demanded a budget slot in
+# *every one* of those slots, and a speaker held one for the whole utterance.
+# With a lead, a session that is already a few chunks ahead asks for nothing,
+# and the budget it is not using goes to whoever wants to start speaking.
+#
+# Generation runs ahead; emission does not. Exactly one chunk leaves per slot,
+# so the viewer's buffer depth — and with it the latency from "decided to speak"
+# to "the candidate sees it" — is unchanged. Shipping early would trade the wait
+# we are trying to remove for an equal delay in every frame.
+#
+# 0 restores the old lockstep behaviour.
+LOOKAHEAD = int(os.environ.get("FLASHHEAD_LOOKAHEAD", "3"))
 DONE_MARK = "__done__"
 
 
@@ -721,6 +738,17 @@ class RendererCore:
         return {s["id"]: {"frames": frames[i], "gen": took if i == 0 else 0.0}
                 for i, s in enumerate(sessions)}
 
+    def _slot_capacity(self, slot_s: float) -> float:
+        """Chunks that fit in a slot, unrounded.
+
+        `_batch_budget` floors this, and on the 4090 the floor throws away 0.89
+        of the 3.89 chunks a slot can hold — 23% of the card. Lockstep could not
+        have used the remainder anyway (a speaker needs a whole slot every slot),
+        but with a lookahead the fraction can be carried and banked, which is why
+        the two changes are worth far more together than apart.
+        """
+        return max(1.0, slot_s / self.gen_ema) if self.gen_ema else 1.0
+
     def _batch_budget(self, slot_s: float) -> int:
         """How many sessions may speak in one slot, fitted from what batches cost.
 
@@ -1005,6 +1033,9 @@ class RendererCore:
             "audio_end_idx": p["cached_audio_duration"] * fps,
             "audio_start_idx": p["cached_audio_duration"] * fps - frame_num,
             "audio_dq": _AudioWindow(cached),
+            # generated but not yet shown: (frames, pcm) in playback order
+            "ready": deque(),
+            "playing": False,        # emission-side counterpart of "speaking"
             "pending": deque(), "buf": np.zeros(0, dtype=np.float32),
             "fade_frames": fade_frames, "idle_timeout_s": idle_timeout_s, "max_seconds": max_seconds,
             "speaking": False, "loop_pos": 0, "last_frame": None, "want_since": None,
@@ -1116,6 +1147,22 @@ class RendererCore:
             # every waiting session into a single slot and then preempted all but
             # the first once the real 0.8 s landed a slot later.
             budget = self._batch_budget(chunk_s)
+            if LOOKAHEAD:
+                # Spend chunk generations, not sessions, and carry what a slot
+                # could not use into the next one. Alone this buys nothing — a
+                # lockstep speaker needs a whole slot every slot and has no use
+                # for a spare fifth of one — but with a lead it can be banked.
+                # The credit is deducted whether or not the quota gets spent,
+                # so what survives a slot is only the sub-1 fraction the integer
+                # floor would have discarded — never idle time. That is the right
+                # bound and it needs no cap: silicon-seconds nobody used are
+                # gone, and a credit that grew while the room was quiet would be
+                # promising work the next slot cannot physically do.
+                self.gen_credit = getattr(self, "gen_credit", 0.0) + self._slot_capacity(chunk_s)
+                quota = int(self.gen_credit)
+                self.gen_credit -= quota
+            else:
+                quota = budget
             speakers = [s for s in live if s["pending"]]
             # want_since marks the start of a TURN, not of a chunk. A session that is
             # already speaking has had its want_since cleared, and must not set it
@@ -1133,14 +1180,46 @@ class RendererCore:
             # shrank below the number of speakers already talking (possible on any
             # GPU fast enough for a budget above 1). Overrunning the slot instead
             # is recoverable — idle chunks are free, so the lag is worked off.
-            ongoing = [s for s in speakers if s["speaking"]]
-            waiting = sorted((s for s in speakers if not s["speaking"]), key=lambda s: s["want_since"])
-            # compare by id: a session dict holds tensors, so `in` would try to
-            # compare those element-wise and raise
-            chosen = {s["id"] for s in ongoing}
-            chosen |= {s["id"] for s in waiting[:max(0, budget - len(ongoing))]}
+            if LOOKAHEAD:
+                # Who needs the GPU *this slot* — not who happens to be speaking.
+                # A session that is already `LOOKAHEAD` chunks ahead asks for
+                # nothing and its budget slot goes to someone who wants to start.
+                # That is the whole change: an utterance no longer reserves a
+                # slot for its full seven seconds, it just has to be kept fed.
+                #
+                # But a sort is only a preference, not a guarantee — and the
+                # comment above this block promises a guarantee. If more sessions
+                # are simultaneously `speaking` with `ready == 0` than the quota
+                # covers, sorting them to the front still truncates the excess at
+                # `[:quota]`. Those tied-for-first sessions ARE mid-utterance and
+                # about to go silent, which is exactly the failure this design is
+                # supposed to rule out. So they are force-admitted, the same way
+                # lockstep force-admitted every `ongoing` session — the slot may
+                # run over its nominal quota, which is recoverable; a gap is not.
+                must = {s["id"] for s in speakers if s["speaking"] and not s["ready"]}
+                rest_quota = max(0, quota - len(must))
+                cands = [s for s in speakers
+                         if s["id"] not in must and len(s["ready"]) < LOOKAHEAD]
+                # Order by how close each one is to running dry, among the
+                # discretionary rest: a session with some lead left but low can
+                # go next slot without a gap; a fresh start can wait a slot longer.
+                cands.sort(key=lambda s: (len(s["ready"]),
+                                          0 if s["speaking"] else 1,
+                                          s["want_since"] or 0.0))
+                chosen = must | {s["id"] for s in cands[:rest_quota]}
+                ongoing = [s for s in speakers if s["speaking"]]
+                if len(must) > quota:
+                    self.slot_overruns += 1
+            else:
+                ongoing = [s for s in speakers if s["speaking"]]
+                waiting = sorted((s for s in speakers if not s["speaking"]),
+                                 key=lambda s: s["want_since"])
+                # compare by id: a session dict holds tensors, so `in` would try to
+                # compare those element-wise and raise
+                chosen = {s["id"] for s in ongoing}
+                chosen |= {s["id"] for s in waiting[:max(0, budget - len(ongoing))]}
             chosen |= {s["id"] for s in live if s["idle_loop"] is None}   # no loop to fall back on
-            if len(ongoing) > budget:
+            if not LOOKAHEAD and len(ongoing) > budget:
                 self.slot_overruns += 1
             self.slot_budget = budget
             # A session once sat deferred for 77 s while only one other spoke and
@@ -1151,9 +1230,9 @@ class RendererCore:
                 print(f"budget {getattr(self, '_budget_last', '-')} -> {budget}  "
                       f"(gen_ema {self.gen_ema:.3f}s, samples {len(self.batch_samples)}, "
                       f"sizes {sorted({b for b, _ in self.batch_samples})}, "
-                      f"ongoing {len(ongoing)}, waiting {len(waiting)})", flush=True)
+                      f"ongoing {len(ongoing)}, chosen {len(chosen)})", flush=True)
                 self._budget_last = budget
-            n_spk = sum(1 for s in speakers if s["id"] in chosen)
+            n_spk = sum(1 for s in speakers if s["id"] in chosen)   # generating, not playing
             self.slot_hist[min(n_spk, LIVE_MAX_SESSIONS)] += 1
 
             # Three phases, so the GPU sees one call per slot instead of one per
@@ -1181,12 +1260,43 @@ class RendererCore:
                                                    talking[0]["audio_start_idx"],
                                                    talking[0]["audio_end_idx"])
                     out = self._run_batch(talking, embs)
-                    for sid, r in out.items():
-                        prep[sid].update(r)
+                    for s in talking:
+                        r = out[s["id"]]
+                        prep[s["id"]].update(r)
+                        self._bank(s, r, prep[s["id"]]["pcm"])
                 except Exception as exc:  # noqa: BLE001
                     for s in talking:
                         prep.pop(s["id"], None)
                         failed(s, exc)
+                quota -= len(talking)
+
+            # Extra rounds: spend what is left of the slot's quota building a
+            # lead for whoever is closest to running dry. This is what makes the
+            # lookahead real — without it a session can only ever keep pace, and
+            # `ready` never rises above the one chunk it just made.
+            t_slot = time.time()
+            while LOOKAHEAD and quota > 0 and time.time() - t_slot < chunk_s * 0.7:
+                c = [s for s in live
+                     if s["open"] and s["pending"] and len(s["ready"]) < LOOKAHEAD]
+                if not c:
+                    break
+                c.sort(key=lambda s: (len(s["ready"]),
+                                      0 if s["speaking"] else 1,
+                                      s["want_since"] or 0.0))
+                take = c[:quota]
+                try:
+                    gs = [self._gen_one(s, now) for s in take]
+                    embs = self._audio_embed_batch([g["emb"] for g in gs],
+                                                   take[0]["audio_start_idx"],
+                                                   take[0]["audio_end_idx"])
+                    out = self._run_batch(take, embs)
+                    for s, g in zip(take, gs):
+                        self._bank(s, out[s["id"]], g["pcm"])
+                except Exception as exc:  # noqa: BLE001
+                    for s in take:
+                        failed(s, exc)
+                    break
+                quota -= len(take)
 
             for s in live:
                 p = prep.get(s["id"])
@@ -1222,6 +1332,46 @@ class RendererCore:
         self.res_t[name] = self.res_t.get(name, 0.0) + now - t0
         return now
 
+    def _bank(self, sess: dict, r: dict, pcm) -> None:
+        """Queue a generated chunk behind whatever lead the session already has.
+
+        One place, because round one and the extra rounds must append in the same
+        order they were generated — the motion latents chain, so a chunk shown out
+        of order would show a face continuing from a frame it never saw.
+        """
+        if r.get("frames") is None:
+            return
+        sess["ready"].append((r["frames"], pcm))
+        st = sess["stats"]
+        st["gen_s"].append(round(r.get("gen", 0.0), 3))
+        st["gpu_chunks"] += 1
+
+    def _gen_one(self, sess: dict, now: float) -> dict:
+        """Take one pending chunk and build what `generate` needs for it.
+
+        Generation only — no emission, no bookkeeping that belongs once per slot.
+        A slot may call this several times for the same session to bank a lead;
+        consecutive chunks are sequentially dependent through the motion latents,
+        so they are separate calls, but they cost the same as anyone else's.
+        """
+        import numpy as np  # noqa: F401  (kept for symmetry with _slot_prep)
+        import torch
+
+        pcm = sess["pending"].popleft()
+        sess["last_speech"] = now
+        sess["audio_dq"].push(pcm)
+        if sess["idle_loop"] is not None and not sess["speaking"]:
+            # entering generation: continue from the frames the viewer is seeing
+            seen = _loop_window(sess["idle_loop"],
+                                (sess["loop_pos"] - sess["motion_n"]) % len(sess["idle_loop"]),
+                                sess["motion_n"])
+            with self.gpu_lock:
+                t = torch.from_numpy(np.ascontiguousarray(seen)).to(self.pipeline.device,
+                                                                    dtype=self.pipeline.param_dtype)
+                sess["motion"] = self.pipeline.vae.encode(((t / 255 - 0.5) * 2).permute(3, 0, 1, 2).unsqueeze(0))
+            sess["speaking"] = True
+        return {"pcm": pcm, "emb": sess["audio_dq"].view()}
+
     def _slot_prep(self, sess: dict, may_speak: bool, now: float):
         """Take one session as far as it can go without the GPU.
 
@@ -1240,59 +1390,36 @@ class RendererCore:
 
         st = sess["stats"]
         n = sess["chunk_samples"]
-        if sess["ended"] and not sess["pending"]:
+        if sess["ended"] and not sess["pending"] and not sess["ready"]:
             sess["reason"] = "stop"; sess["open"] = False; sess["done"].set(); return None
-        if not sess["pending"] and now - sess["last_speech"] > sess["idle_timeout_s"]:
+        if not sess["pending"] and not sess["ready"] and now - sess["last_speech"] > sess["idle_timeout_s"]:
             sess["reason"] = "idle"; sess["open"] = False; sess["done"].set(); return None
         if now - sess["t0"] > sess["max_seconds"]:
             sess["reason"] = "max_seconds"; sess["open"] = False; sess["done"].set(); return None
 
         _rt = time.perf_counter() if RESIDENCY_TIMING else 0.0
-        is_speech = bool(sess["pending"]) and may_speak
-        deferred = False
-        if is_speech:
-            pcm = sess["pending"].popleft()
-            sess["last_speech"] = now
-            if sess["want_since"] is not None:
-                st["wait_to_speak_s"].append(round(now - sess["want_since"], 2))
-                # when this turn began, relative to the session's own start. A run
-                # starts with an empty GPU, so its first turns wait for nobody and
-                # report a wait no steady state would give — the transient flatters
-                # the numbers. Keeping the time lets the statistics drop it.
-                st["wait_at_s"].append(round(sess["want_since"] - sess["t0"], 1))
-                sess["want_since"] = None
+        gen_speech = bool(sess["pending"]) and may_speak
+        if gen_speech:
+            g = self._gen_one(sess, now)
+            pcm, emb = g["pcm"], g["emb"]
         else:
-            pcm = np.zeros(n, dtype=np.float32)
-            # "deferred" and "silence" are different things: deferred means this
-            # session had speech ready and another session held the slot, which is
-            # what the Gantt draws as waiting. Silence means it had nothing to say.
-            deferred = bool(sess["pending"])
-            if deferred:
+            pcm, emb = np.zeros(n, dtype=np.float32), None
+            if sess["pending"] and not sess["ready"]:
+                # wanted to speak, has nothing made, did not get the GPU
                 st["deferred_chunks"] += 1
+            # The window follows the GENERATION head, not the playhead: it holds
+            # the eight seconds around the chunk being made, so it advances once
+            # per generated chunk, in order. A session running ahead — frames
+            # ready, not generating this slot — has not moved its head, and
+            # pushing silence here would punch a hole into the middle of the
+            # utterance it is in the middle of making.
+            if not sess["ready"]:
+                sess["audio_dq"].push(pcm)
+            if sess["idle_loop"] is None:          # nothing to fall back on yet
+                emb = sess["audio_dq"].view()
         _rt = self._res("prep:decide", _rt)
-        sess["audio_dq"].push(pcm)                  # the 8 s window advances either way
-        _rt = self._res("prep:audio_window", _rt)
-
-        emb = None
-        if is_speech or sess["idle_loop"] is None:
-            if sess["idle_loop"] is not None and not sess["speaking"]:
-                # entering generation: continue from the frames the viewer is seeing
-                seen = _loop_window(sess["idle_loop"],
-                                    (sess["loop_pos"] - sess["motion_n"]) % len(sess["idle_loop"]),
-                                    sess["motion_n"])
-                import torch
-
-                with self.gpu_lock:
-                    t = torch.from_numpy(np.ascontiguousarray(seen)).to(self.pipeline.device,
-                                                                        dtype=self.pipeline.param_dtype)
-                    sess["motion"] = self.pipeline.vae.encode(((t / 255 - 0.5) * 2).permute(3, 0, 1, 2).unsqueeze(0))
-                sess["speaking"] = True
-                _rt = self._res("prep:motion_inject", _rt)
-            emb = sess["audio_dq"].view()          # embedded with the rest of the slot
-            _rt = self._res("prep:window", _rt)
         self.res_n += 1 if RESIDENCY_TIMING else 0
-        return {"pcm": pcm, "is_speech": is_speech, "deferred": deferred, "emb": emb,
-                "frames": None, "gen": 0.0}
+        return {"pcm": pcm, "gen_speech": gen_speech, "emb": emb, "frames": None, "gen": 0.0}
 
     def _emit(self, sess: dict, p: dict, behind: float, now: float) -> None:
         """Finish one session's slot: pick the frames, queue them, record the chunk."""
@@ -1300,40 +1427,65 @@ class RendererCore:
 
         st = sess["stats"]
         _rt = time.perf_counter() if RESIDENCY_TIMING else 0.0
-        is_speech, frames, gen = p["is_speech"], p["frames"], p["gen"]
-        if frames is None:                       # not generating: play the idle loop
+        gen = p["gen"]
+        # Exactly one chunk leaves per slot whatever generation did. That is what
+        # keeps the viewer's buffer — and so the latency from "decided to speak"
+        # to "the candidate sees it" — the same as it was before the lookahead.
+        is_speech = bool(sess["ready"])
+        if is_speech:
+            frames, pcm = sess["ready"].popleft()
+            if sess["want_since"] is not None:
+                # the wait ends when the mouth moves, not when the GPU ran
+                st["wait_to_speak_s"].append(round(now - sess["want_since"], 2))
+                # when this turn began, relative to the session's own start. A run
+                # starts with an empty GPU, so its first turns wait for nobody and
+                # report a wait no steady state would give — the transient flatters
+                # the numbers. Keeping the time lets the statistics drop it.
+                st["wait_at_s"].append(round(sess["want_since"] - sess["t0"], 1))
+                sess["want_since"] = None
+            sess["playing"] = True
+        else:                                    # nothing ready: play the idle loop
+            pcm = p["pcm"]
             loop = sess["idle_loop"]
+            if loop is None:
+                # Before the first idle loop exists a session has nothing to fall
+                # back on. It is force-admitted for exactly that reason, so this
+                # only happens if its generation failed; emitting nothing is the
+                # honest response, and the next slot tries again.
+                return
             frames = _loop_window(loop, sess["loop_pos"], sess["slice_len"])
             sess["loop_pos"] = (sess["loop_pos"] + sess["slice_len"]) % len(loop)
-            if sess["speaking"]:                 # returning from a turn: fade into the loop
+            if sess["playing"]:                  # returning from a turn: fade into the loop
                 f = sess["fade_frames"]
                 frames = frames.copy()
                 w = np.linspace(0, 1, f + 2)[1:-1].reshape(-1, 1, 1, 1)
                 frames[:f] = (sess["last_frame"].astype(np.float32) * (1 - w)
                               + frames[:f].astype(np.float32) * w).astype(np.uint8)
-                sess["speaking"] = False
-        else:
-            st["gen_s"].append(round(gen, 3))
+                sess["playing"] = False
+            if not sess["pending"]:
+                sess["speaking"] = False         # generation head has left the utterance
 
         _rt = self._res("emit:frames", _rt)
         sess["vq"].put(frames)
         sess["last_frame"] = frames[-1]
-        sess["aq"].put((np.clip(p["pcm"], -1.0, 1.0) * 32767).astype(np.int16).tobytes())
+        sess["aq"].put((np.clip(pcm, -1.0, 1.0) * 32767).astype(np.int16).tobytes())
         _rt = self._res("emit:queues", _rt)
         sess["k"] += 1
         st["chunks"] = sess["k"]
         st["speech_chunks"] += int(is_speech)
-        st["gpu_chunks"] += int(p["frames"] is not None)
+        st["lead"] = max(st.get("lead", 0), len(sess["ready"]))
         st["behind_s"].append(round(behind, 2))
         _rt = self._res("emit:stats", _rt)
         sess["ship"].ship_new_files()
         _rt = self._res("emit:ship_files", _rt)
-        kind = "speech" if is_speech else ("deferred" if p["deferred"] else "silence")
+        kind = "speech" if is_speech else ("deferred" if sess["pending"] else "silence")
         # every speech and every deferred chunk is logged: the studio reconstructs
         # the Gantt's spans from these lines, so a skipped one is a hole in the chart
         if kind != "silence" or sess["k"] % 20 == 0:
             sess["ship"].log(f"live: chunk {sess['k']} {kind} "
-                             f"gen {gen:.2f}s behind {behind:.2f}s queued {len(sess['pending'])*sess['chunk_s']:.1f}s")
+                             f"gen {gen:.2f}s behind {behind:.2f}s "
+                             f"lead {len(sess['ready'])} "
+                             f"queued {len(sess['pending'])*sess['chunk_s']:.1f}s")
         self._res("emit:log", _rt)
 
     def _close_live(self, sess: dict) -> dict:
@@ -1381,6 +1533,7 @@ class RendererCore:
                # and 0.0 to the rest, so summing these over every session counts
                # each slot once — which is what occupancy needs.
                "gpu_seconds": round(sum(st["gen_s"]), 2),
+               "lead_max": st.get("lead", 0),
                "turns": turns, "turns_frozen": len(frozen),
                "freeze_out": round(len(frozen) / turns, 4) if turns else 0.0,
                "wait_p50_s": _pct(waits, 50), "wait_p95_s": _pct(waits, 95),
