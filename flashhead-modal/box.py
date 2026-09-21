@@ -477,7 +477,8 @@ class VastProvider(Provider):
 
     def rent(self, kind: str, name: str, offer: int | None = None,
              geo: str = "asia", image: str = "pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel",
-             disk: int = 80, max_price: float | None = None, **kw) -> Box:
+             disk: int = 80, max_price: float | None = None, dry_run: bool = False,
+             **kw) -> Box:
         pub = self._ssh_pub()
         if offer is None:
             found = self.offers(kind, geo=geo, max_price=max_price, limit=1)
@@ -496,6 +497,19 @@ class VastProvider(Provider):
             "target_state": "running", "cancel_unavail": True,
             "image_login": None, "use_jupyter_lab": False,
         }
+        if dry_run:
+            # A malformed body is answered by the marketplace taking the offer
+            # and then failing, so the request gets read before it is sent once.
+            shown = dict(body, onstart=f"<{len(body['onstart'])} bytes: provision.sh + setup.sh>")
+            print(f"PUT {self.API}/asks/{offer}/\n"
+                  + json.dumps(shown, indent=2, ensure_ascii=False))
+            print(f"\n오퍼 {offer}: {pick.get('gpu_name')} ${pick.get('dph_total', 0):.3f}/hr "
+                  f"· {pick.get('geolocation')}\n보내지 않았습니다 (--dry-run).")
+            return Box(vendor=self.name, id="dry-run", name=name,
+                       kind=str(pick.get("gpu_name", kind)), state="dry-run",
+                       resource="instance", where=str(pick.get("geolocation", "?")),
+                       billing=False, note="보내지 않음")
+
         r = self._api(f"asks/{offer}/", "PUT", body)
         if not r.get("success"):
             raise RuntimeError(r.get("msg") or str(r)[:300])
@@ -620,6 +634,7 @@ def main() -> None:
     pr.add_argument("--image", default="pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel")
     pr.add_argument("--disk", type=int, default=80, help="vast: GB (가중치 8GB + 휠)")
     pr.add_argument("--max-price", type=float, default=None, help="vast: $/hr 상한")
+    pr.add_argument("--dry-run", action="store_true", help="vast: 보낼 요청만 보여준다")
 
     po = sub.add_parser("offers", help="빌릴 수 있는 것을 본다 (vast: 돈 안 듦, 키도 필요 없음)")
     po.add_argument("vendor", choices=["vast"])
@@ -687,12 +702,17 @@ def main() -> None:
 
     if a.cmd == "rent":
         p = PROVIDERS[a.vendor]()
-        why = p.preflight()
+        # A dry run sends nothing, so it must not require a credential — the
+        # moment you most want to read the request is before there is a key.
+        why = None if getattr(a, "dry_run", False) else p.preflight()
         if why:
             sys.exit(f"⚠ {why}")
         b = p.rent(a.kind, a.name, teamspace=a.teamspace, cloud=a.cloud,
                    interruptible=a.interruptible, app=a.app, offer=a.offer,
-                   geo=a.geo, image=a.image, disk=a.disk, max_price=a.max_price)
+                   geo=a.geo, image=a.image, disk=a.disk, max_price=a.max_price,
+                   dry_run=a.dry_run)
+        if b.state == "dry-run":
+            return
         print(f"● {b.ref} · {b.kind} · {b.state} · {b.where}"
               + (f"\n  {b.note}" if b.note else ""))
         print(f"  끝나면:  python box.py stop {b.ref}")
