@@ -1374,6 +1374,9 @@ class RendererCore:
                "turns": turns, "turns_frozen": len(frozen),
                "freeze_out": round(len(frozen) / turns, 4) if turns else 0.0,
                "wait_p50_s": _pct(waits, 50), "wait_p95_s": _pct(waits, 95),
+               # the raw waits, so a run's percentile can be taken over every
+               # turn it produced rather than over one session's dozen
+               "waits_s": [round(w, 2) for w in waits],
                "wait_frozen_mean_s": round(sum(frozen) / len(frozen), 2) if frozen else 0.0,
                "ended_by": sess["reason"], "ffmpeg_rc": rc, "slot_overruns": self.slot_overruns - sess["overruns_at_open"],
                "slot_budget": self.slot_budget, "slot_speakers": list(self.slot_hist),
@@ -1641,6 +1644,7 @@ def verdict(results: dict) -> dict:
         return {"pass": False, "reason": "every session errored"}
     turns = sum(r.get("turns", 0) for r in ok)
     frozen = sum(r.get("turns_frozen", 0) for r in ok)
+    pooled = sorted(w for r in ok for w in (r.get("waits_s") or []))
     agg = {
         "sessions": len(results),
         "errors": len(results) - len(ok),
@@ -1649,8 +1653,17 @@ def verdict(results: dict) -> dict:
         # run-wide, not the mean of per-session rates: a session with three turns
         # must not weigh the same as one with forty
         "freeze_out": round(frozen / turns, 4) if turns else 0.0,
-        "wait_p95_s": max((r.get("wait_p95_s", 0.0) for r in ok), default=0.0),
-        "wait_max_s": max((r.get("wait_to_speak_max_s", 0.0) for r in ok), default=0.0),
+        # A true percentile over every turn in the run, not the worst of the
+        # per-session percentiles. Each session contributes about fifteen turns,
+        # so its own p95 is its worst turn, and taking the max across sessions
+        # made the gate read "no single turn anywhere waited more than the limit".
+        # That is a maximum wearing a percentile's name, and it gets *stricter*
+        # the longer the run — more draws, more chances at one bad one — which
+        # turns a better-sampled measurement into a harsher one.
+        "wait_p50_s": _pct(pooled, 50),
+        "wait_p95_s": _pct(pooled, 95),
+        "wait_p99_s": _pct(pooled, 99),
+        "wait_max_s": max(pooled, default=0.0),
         "behind_tail_s": max((r.get("behind_tail_s") or 0.0 for r in ok), default=0.0),
         "gen_median_s": _pct([r["gen_median_s"] for r in ok if r.get("gen_median_s")], 50),
         "slot_budget": max((r.get("slot_budget", 0) for r in ok), default=0),
