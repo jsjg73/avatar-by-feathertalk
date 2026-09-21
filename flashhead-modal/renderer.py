@@ -1276,8 +1276,19 @@ class RendererCore:
             # `ready` never rises above the one chunk it just made.
             t_slot = time.time()
             while LOOKAHEAD and quota > 0 and time.time() - t_slot < chunk_s * 0.7:
+                # `playing` only becomes true once `_emit` has actually shown a
+                # frame for the run this session is in the middle of — it stays
+                # false for the entire slot where a NEW turn is first admitted,
+                # because `_emit` for that slot has not run yet. Requiring it
+                # here keeps this loop from spending the slot's spare quota
+                # building a lead for a turn nobody has seen the start of yet:
+                # a session with a single 0.96 s turnaround measured a 1.6 s
+                # median time-to-first-frame before this line existed, because
+                # an idle room let this loop bank 2-3 chunks ahead of a turn
+                # before its first one ever reached `_emit`. Once a turn's first
+                # frame is on screen, building it a lead is exactly the point.
                 c = [s for s in live
-                     if s["open"] and s["pending"] and len(s["ready"]) < LOOKAHEAD]
+                     if s["open"] and s["pending"] and s["playing"] and len(s["ready"]) < LOOKAHEAD]
                 if not c:
                     break
                 c.sort(key=lambda s: (len(s["ready"]),

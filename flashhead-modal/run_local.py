@@ -21,13 +21,14 @@ import argparse
 import json
 import pathlib
 import random
+import sys
 import threading
 import time
 import uuid
 import wave
 
 from renderer import (CKPT, GATES, LIVE_MAX_SESSIONS, WAV2VEC, LocalHost, RendererCore,
-                      print_summary, verdict)
+                      print_summary, verdict, verdict_line)
 
 
 def fetch_weights(include_pro: bool = False) -> None:
@@ -45,7 +46,7 @@ def fetch_weights(include_pro: bool = False) -> None:
 def bench(image: str, audio: str, sessions: int, minutes: float, gap_s: float,
           stagger_s: float, model_type: str, out_dir: str | None,
           core: RendererCore | None = None, host: LocalHost | None = None,
-          jitter: float = 0.5, seed: int = 0) -> dict:
+          jitter: float = 0.5, seed: int = 0, lanes: int = 0) -> dict:
     """Drive `sessions` live sessions and report the same numbers `mux` does.
 
     `core`/`host` let a sweep load the pipeline once instead of paying the 85-125 s
@@ -53,6 +54,15 @@ def bench(image: str, audio: str, sessions: int, minutes: float, gap_s: float,
     session's turn is randomly displaced: without it every session speaks on the
     same period with a constant offset, so the run measures one arbitrary phase
     alignment rather than how often turns actually collide.
+
+    `lanes` (0 = off) instead assigns turns to a deterministic schedule: sessions
+    are split into ceil(sessions/lanes) waves of `lanes` sessions each, and every
+    session in a wave starts speaking at the same instant, `gap_s/waves` apart
+    from the next wave — the L4 6-session x 7 s trick generalised to `lanes`
+    concurrent speakers. It exists to answer one question empirically: can a
+    server-controlled schedule, not random arrival, pack `lanes` x (gap_s/utterance)
+    sessions onto one budget with near-zero wait? Pass jitter=0 alongside it —
+    any per-turn jitter re-randomises the very thing being held fixed.
     """
     with wave.open(audio, "rb") as w:
         pcm = w.readframes(w.getnframes())
@@ -133,7 +143,12 @@ def bench(image: str, audio: str, sessions: int, minutes: float, gap_s: float,
     # a 7.07 s utterance means the opening turns collide by construction and then
     # take several cycles of jitter to spread out. That transient was being
     # measured as if it were load.
-    threads += [threading.Thread(target=drive, args=(sid, i * stagger_s + rng.uniform(0, gap_s)),
+    if lanes:
+        waves = -(-sessions // lanes)                       # ceil
+        speak_delay = [(i // lanes) * (gap_s / waves) for i in range(sessions)]
+    else:
+        speak_delay = [i * stagger_s + rng.uniform(0, gap_s) for i in range(sessions)]
+    threads += [threading.Thread(target=drive, args=(sid, speak_delay[i]),
                                  daemon=True) for i, sid in enumerate(ids)]
     threads += [threading.Thread(target=drain, args=(sid,), daemon=True) for sid in ids]
     for t in threads:
@@ -259,6 +274,10 @@ def main() -> None:
     p.add_argument("--jitter", type=float, default=0.5,
                    help="random displacement of each turn as a fraction of --gap-s (0 = fixed phase)")
     p.add_argument("--out-json", default="bench/sweep.json", help="where --sweep writes its result")
+    p.add_argument("--lanes", type=int, default=0,
+                   help="deterministic schedule instead of random arrival: N concurrent "
+                        "speaker slots, filled in waves gap_s/waves apart. Pass --jitter 0 with it.")
+    p.add_argument("--verdict", action="store_true", help="print pass/fail against GATES and exit non-zero on fail")
     a = p.parse_args()
     if a.fetch_weights:
         fetch_weights(a.include_pro)
@@ -268,8 +287,13 @@ def main() -> None:
         sweep(a.image, a.audio, [int(x) for x in a.sweep.split(",")], a.minutes, a.gap_s,
               a.stagger_s, a.model, a.jitter, a.out_json)
         return
-    bench(a.image, a.audio, a.sessions, a.minutes, a.gap_s, a.stagger_s, a.model, a.out,
-          jitter=a.jitter)
+    res = bench(a.image, a.audio, a.sessions, a.minutes, a.gap_s, a.stagger_s, a.model, a.out,
+               jitter=a.jitter, lanes=a.lanes)
+    if a.verdict:
+        v = verdict(res)
+        print(verdict_line(res))
+        if not v.get("pass"):
+            sys.exit(1)
 
 
 if __name__ == "__main__":
