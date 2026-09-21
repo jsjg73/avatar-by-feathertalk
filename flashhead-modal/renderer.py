@@ -1143,6 +1143,16 @@ class RendererCore:
             if len(ongoing) > budget:
                 self.slot_overruns += 1
             self.slot_budget = budget
+            # A session once sat deferred for 77 s while only one other spoke and
+            # two budget slots looked free. Nothing in the log could say what the
+            # budget actually was at that moment, so it gets written down whenever
+            # it moves — the number that decides who speaks must be observable.
+            if budget != getattr(self, "_budget_last", None):
+                print(f"budget {getattr(self, '_budget_last', '-')} -> {budget}  "
+                      f"(gen_ema {self.gen_ema:.3f}s, samples {len(self.batch_samples)}, "
+                      f"sizes {sorted({b for b, _ in self.batch_samples})}, "
+                      f"ongoing {len(ongoing)}, waiting {len(waiting)})", flush=True)
+                self._budget_last = budget
             n_spk = sum(1 for s in speakers if s["id"] in chosen)
             self.slot_hist[min(n_spk, LIVE_MAX_SESSIONS)] += 1
 
