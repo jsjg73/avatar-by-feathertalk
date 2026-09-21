@@ -81,5 +81,12 @@ for L in "$OUT"/interview-1.log "$OUT"/sweep.log; do
     [ -f "$L" ] && "$PY" gantt.py "$L" --title "$CARD $(basename "$L" .log)" 2>&1 | sed 's/^/   /'
 done
 
+# A marker, for the same reason provision.sh writes one: whoever is watching
+# needs to tell "finished" from "died", and a log that stopped growing looks
+# identical either way. Watch it as: DONE present → finished; process gone with
+# no DONE → died. Do not ask `pgrep -f measure.sh` — the watcher's own remote
+# command line contains that string, so the pattern matches itself and the
+# answer is always "still running". Use the pid, or this file.
+date -u +%FT%TZ > "$OUT/DONE"
 echo; echo "== 끝. 가져갈 것: $OUT"
 ls -la "$OUT"
