@@ -21,7 +21,13 @@ MODE="${1:-full}"
 # minutes of metered time to learn that a filename was wrong.
 export FLASHHEAD_WARMUP="${FLASHHEAD_WARMUP:-$PWD/inputs/newscaster.png}"
 [ -f "$FLASHHEAD_WARMUP" ] || { echo "참조 이미지가 없습니다: $FLASHHEAD_WARMUP"; exit 1; }
+# Absolute, all of them. `RendererCore.load()` does os.chdir(SRC), so a relative
+# path means different things before and after the model is loaded: `bench` opens
+# its audio first and works, `sweep` loads once and then opens per point, by which
+# time the working directory is the upstream checkout. The sweep died on exactly
+# that after the interview run had passed with the same argument.
 IMG_ABS="$PWD/inputs/newscaster.png"
+AUD_ABS="$PWD/inputs/q_avatar_7s.wav"
 
 CARD=$("$PY" -c "import torch;print(torch.cuda.get_device_name(0).replace(' ','_'))" 2>/dev/null || echo unknown)
 OUT="bench/$CARD-$(date -u +%m%d-%H%M)"
@@ -66,13 +72,13 @@ step batch-curve 8 "$PY" spike_batch.py --batches 1,2,4,8 --image "$IMG_ABS"
 #    Residency timing is on — re-measuring it after the ring buffer and the
 #    batched embedding is the other thing left open.
 step interview-1 4 env FLASHHEAD_RESIDENCY_TIMING=1 \
-    "$PY" run_local.py --audio inputs/q_avatar_7s.wav --image inputs/newscaster.png \
+    "$PY" run_local.py --audio "$AUD_ABS" --image "$IMG_ABS" \
     --sessions 1 --minutes 3 --gap-s 42 --jitter 0
 
 # 4. how many of those fit. The sweep's own verdict gates on freeze-out, wait
 #    p95 and video lag; the gantt is what makes a failure legible.
 step sweep 18 env FLASHHEAD_RESIDENCY_TIMING=1 \
-    "$PY" run_local.py --audio inputs/q_avatar_7s.wav --image inputs/newscaster.png \
+    "$PY" run_local.py --audio "$AUD_ABS" --image "$IMG_ABS" \
     --sweep 1,4,8,16,24 --minutes 3 --gap-s 42 --jitter 0.5 \
     --out-json "$OUT/sweep.json"
 

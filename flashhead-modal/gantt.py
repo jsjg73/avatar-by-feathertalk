@@ -33,11 +33,42 @@ LINE = re.compile(
 )
 
 
+SWEEP_HEAD = re.compile(r"^\s*(\d+) 세션\s*$")
+
+
+def sections(text: str) -> list:
+    """스윕 로그를 지점별로 나눈다 — [(제목, 본문), …].
+
+    A sweep runs its points one after another and **each point restarts the
+    clock at zero**, because the timestamps are per shipper. Drawing the whole
+    file as one chart therefore lays five separate runs on top of each other and
+    reports concurrency that never happened. The points are separated by the
+    banner `run_local.sweep` prints, so split on that and draw each on its own
+    axis. A file without the banner is one run, and comes back as one section.
+    """
+    out, cur, title = [], [], None
+    for line in text.splitlines():
+        m = SWEEP_HEAD.match(line)
+        if m:
+            if cur and title:
+                out.append((title, "\n".join(cur)))
+            title, cur = f"{m.group(1)} 세션", []
+            continue
+        cur.append(line)
+    if title and cur:
+        out.append((title, "\n".join(cur)))
+    return out or [("", text)]
+
+
 def parse(path: pathlib.Path) -> dict:
     """로그에서 세션별 (시각, 종류) 이벤트를 모은다."""
+    return parse_text(path.read_text(errors="ignore"))
+
+
+def parse_text(text: str) -> dict:
     ev: dict = defaultdict(list)
     behind: dict = defaultdict(list)
-    for raw in path.read_text(errors="ignore").splitlines():
+    for raw in text.splitlines():
         m = LINE.search(raw)
         if not m:
             continue
@@ -95,7 +126,8 @@ def waits(events: list) -> list:
     return runs
 
 
-def render(data: dict, title: str) -> str:
+def chart(data: dict, title: str) -> str:
+    """한 판의 카드 하나. 문서 전체는 page() 가 감싼다."""
     ev = data["events"]
     if not ev:
         raise SystemExit("로그에서 청크 줄을 찾지 못했다 — run_local.py 로그가 맞는지 확인할 것")
@@ -143,37 +175,8 @@ def render(data: dict, title: str) -> str:
     def stat(v, f="{:.2f}"):
         return f.format(v) if v else "—"
 
-    return f"""<!doctype html><meta charset="utf-8"><title>{html.escape(title)}</title>
-<style>
-:root{{--paper:#F6F7F9;--surface:#FFF;--ink:#141A24;--muted:#5C6672;--faint:#8A929C;
---line:#DDE1E7;--grid:#E7EAEE;--talk:#2F6FB0;--wait:#C77B24;--conc:#8FA8C4;
---sans:"IBM Plex Sans KR",ui-sans-serif,system-ui,-apple-system,"Apple SD Gothic Neo",sans-serif;
---mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace}}
-@media (prefers-color-scheme:dark){{:root:not([data-theme=light]){{--paper:#0F141B;--surface:#161D26;
---ink:#E6E9EE;--muted:#98A2AE;--faint:#6B7684;--line:#27303C;--grid:#1E2733;--talk:#6EA8FE;
---wait:#E0A33C;--conc:#3D5570}}}}
-body{{margin:0;padding:28px;background:var(--paper);color:var(--ink);font-family:var(--sans)}}
-.wrap{{max-width:1060px;margin:0 auto}}
-h1{{font-size:18px;margin:0 0 4px}}
-.sub{{color:var(--muted);font-size:13px;margin:0 0 18px;font-family:var(--mono)}}
-.card{{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:18px;margin-bottom:16px}}
-.kpi{{display:flex;gap:26px;flex-wrap:wrap;margin-bottom:16px}}
-.kpi div{{font-size:13px;color:var(--muted)}}
-.kpi b{{display:block;font-size:20px;color:var(--ink);font-family:var(--mono);font-weight:600}}
-svg{{display:block;width:100%;height:auto;overflow:visible}}
-.lbl{{font:11px var(--mono);fill:var(--faint);text-anchor:end}}
-.tick{{font:10px var(--mono);fill:var(--faint);text-anchor:middle}}
-.grid{{stroke:var(--grid);stroke-width:1}}
-.life{{fill:var(--line)}}
-.talk{{fill:var(--talk)}} .wait{{fill:var(--wait)}} .conc{{fill:var(--conc)}}
-.key{{display:flex;gap:16px;font-size:12px;color:var(--muted);margin-top:10px;align-items:center}}
-.key i{{width:12px;height:12px;border-radius:2px;display:inline-block;margin-right:5px;vertical-align:-2px}}
-h2{{font-size:13px;color:var(--muted);margin:22px 0 6px;font-weight:600}}
-</style>
-<div class=wrap>
-<h1>{html.escape(title)}</h1>
+    return f"""<h2 class=sec>{html.escape(title)}</h2>
 <p class=sub>{len(sids)}세션 · {span_s:.0f}초 · 슬롯 {SLOT_S}s</p>
-
 <div class=card>
   <div class=kpi>
     <div>세션<b>{len(sids)}</b></div>
@@ -198,8 +201,41 @@ h2{{font-size:13px;color:var(--muted);margin:22px 0 6px;font-weight:600}}
     <span><i style="background:var(--conc)"></i>슬롯별 동시 발화 수</span>
   </div>
 </div>
-</div>
 """
+
+
+STYLE = """
+:root{{--paper:#F6F7F9;--surface:#FFF;--ink:#141A24;--muted:#5C6672;--faint:#8A929C;
+--line:#DDE1E7;--grid:#E7EAEE;--talk:#2F6FB0;--wait:#C77B24;--conc:#8FA8C4;
+--sans:"IBM Plex Sans KR",ui-sans-serif,system-ui,-apple-system,"Apple SD Gothic Neo",sans-serif;
+--mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace}}
+@media (prefers-color-scheme:dark){{:root:not([data-theme=light]){{--paper:#0F141B;--surface:#161D26;
+--ink:#E6E9EE;--muted:#98A2AE;--faint:#6B7684;--line:#27303C;--grid:#1E2733;--talk:#6EA8FE;
+--wait:#E0A33C;--conc:#3D5570}}}}
+body{{margin:0;padding:28px;background:var(--paper);color:var(--ink);font-family:var(--sans)}}
+.wrap{{max-width:1060px;margin:0 auto}}
+h1{{font-size:18px;margin:0 0 4px}}
+.sub{{color:var(--muted);font-size:13px;margin:0 0 18px;font-family:var(--mono)}}
+.card{{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:18px;margin-bottom:16px}}
+.kpi{{display:flex;gap:26px;flex-wrap:wrap;margin-bottom:16px}}
+.kpi div{{font-size:13px;color:var(--muted)}}
+.kpi b{{display:block;font-size:20px;color:var(--ink);font-family:var(--mono);font-weight:600}}
+svg{{display:block;width:100%;height:auto;overflow:visible}}
+.lbl{{font:11px var(--mono);fill:var(--faint);text-anchor:end}}
+.tick{{font:10px var(--mono);fill:var(--faint);text-anchor:middle}}
+.grid{{stroke:var(--grid);stroke-width:1}}
+.life{{fill:var(--line)}}
+.talk{{fill:var(--talk)}} .wait{{fill:var(--wait)}} .conc{{fill:var(--conc)}}
+.key{{display:flex;gap:16px;font-size:12px;color:var(--muted);margin-top:10px;align-items:center}}
+.key i{{width:12px;height:12px;border-radius:2px;display:inline-block;margin-right:5px;vertical-align:-2px}}
+h2{{font-size:13px;color:var(--muted);margin:22px 0 6px;font-weight:600}}
+"""
+
+
+def page(title: str, cards: list) -> str:
+    return (f'<!doctype html><meta charset="utf-8"><title>{html.escape(title)}</title>'
+            f"<style>{STYLE}.sec{{font-size:16px;margin:26px 0 2px}}</style>"
+            f"<div class=wrap><h1>{html.escape(title)}</h1>" + "".join(cards) + "</div>")
 
 
 def main() -> None:
@@ -210,8 +246,18 @@ def main() -> None:
     ap.add_argument("--title", default=None)
     a = ap.parse_args()
     out = a.out or a.log.with_suffix(".html")
-    out.write_text(render(parse(a.log), a.title or a.log.name), encoding="utf-8")
-    print(f"{out}", flush=True)
+    secs = sections(a.log.read_text(errors="ignore"))
+    title = a.title or a.log.name
+    cards = []
+    for name, body in secs:
+        d = parse_text(body)
+        if not d["events"]:          # a point that never logged a chunk
+            continue
+        cards.append(chart(d, name or title))
+    if not cards:
+        raise SystemExit("로그에서 청크 줄을 찾지 못했다 — run_local.py 로그가 맞는지 확인할 것")
+    out.write_text(page(title, cards), encoding="utf-8")
+    print(f"{out}  ({len(cards)}개 구간)", flush=True)
 
 
 if __name__ == "__main__":
