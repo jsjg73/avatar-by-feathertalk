@@ -15,6 +15,13 @@ cd "$(dirname "$0")"
 [ -f /root/flashhead.env ] && . /root/flashhead.env
 PY="${PYTHON:-python3}"
 MODE="${1:-full}"
+# The renderer warms up against FLASHHEAD_WARMUP, which defaults to a path that
+# only ever existed inside the Modal image (/root/warmup.png). On a rented box
+# nothing sets it, and the failure lands in `_warm` after the model has loaded —
+# minutes of metered time to learn that a filename was wrong.
+export FLASHHEAD_WARMUP="${FLASHHEAD_WARMUP:-$PWD/inputs/newscaster.png}"
+[ -f "$FLASHHEAD_WARMUP" ] || { echo "참조 이미지가 없습니다: $FLASHHEAD_WARMUP"; exit 1; }
+IMG_ABS="$PWD/inputs/newscaster.png"
 
 CARD=$("$PY" -c "import torch;print(torch.cuda.get_device_name(0).replace(' ','_'))" 2>/dev/null || echo unknown)
 OUT="bench/$CARD-$(date -u +%m%d-%H%M)"
@@ -51,7 +58,7 @@ step embed-correctness 3 "$PY" check_embed.py --batch 8
 
 # 2. the batch curve, and with it the number that decides the card:
 #    a slot is 0.96 s, so anything under 0.48 s at B=1 earns budget 2.
-step batch-curve 8 "$PY" spike_batch.py --batches 1,2,4,8
+step batch-curve 8 "$PY" spike_batch.py --batches 1,2,4,8 --image "$IMG_ABS"
 
 [ "$MODE" = quick ] && { echo; echo "== quick 종료 · $OUT"; exit 0; }
 
