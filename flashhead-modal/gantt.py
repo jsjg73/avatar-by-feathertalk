@@ -175,8 +175,8 @@ def chart(data: dict, title: str) -> str:
     def stat(v, f="{:.2f}"):
         return f.format(v) if v else "—"
 
-    return f"""<h2 class=sec>{html.escape(title)}</h2>
-<p class=sub>{len(sids)}세션 · {span_s:.0f}초 · 슬롯 {SLOT_S}s</p>
+    heading = f"<h2 class=sec>{html.escape(title)}</h2>\n" if title else ""
+    return f"""{heading}<p class=sub>{len(sids)}세션 · {span_s:.0f}초 · 슬롯 {SLOT_S}s</p>
 <div class=card>
   <div class=kpi>
     <div>세션<b>{len(sids)}</b></div>
@@ -205,30 +205,30 @@ def chart(data: dict, title: str) -> str:
 
 
 STYLE = """
-:root{{--paper:#F6F7F9;--surface:#FFF;--ink:#141A24;--muted:#5C6672;--faint:#8A929C;
+:root{--paper:#F6F7F9;--surface:#FFF;--ink:#141A24;--muted:#5C6672;--faint:#8A929C;
 --line:#DDE1E7;--grid:#E7EAEE;--talk:#2F6FB0;--wait:#C77B24;--conc:#8FA8C4;
 --sans:"IBM Plex Sans KR",ui-sans-serif,system-ui,-apple-system,"Apple SD Gothic Neo",sans-serif;
---mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace}}
-@media (prefers-color-scheme:dark){{:root:not([data-theme=light]){{--paper:#0F141B;--surface:#161D26;
+--mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){--paper:#0F141B;--surface:#161D26;
 --ink:#E6E9EE;--muted:#98A2AE;--faint:#6B7684;--line:#27303C;--grid:#1E2733;--talk:#6EA8FE;
---wait:#E0A33C;--conc:#3D5570}}}}
-body{{margin:0;padding:28px;background:var(--paper);color:var(--ink);font-family:var(--sans)}}
-.wrap{{max-width:1060px;margin:0 auto}}
-h1{{font-size:18px;margin:0 0 4px}}
-.sub{{color:var(--muted);font-size:13px;margin:0 0 18px;font-family:var(--mono)}}
-.card{{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:18px;margin-bottom:16px}}
-.kpi{{display:flex;gap:26px;flex-wrap:wrap;margin-bottom:16px}}
-.kpi div{{font-size:13px;color:var(--muted)}}
-.kpi b{{display:block;font-size:20px;color:var(--ink);font-family:var(--mono);font-weight:600}}
-svg{{display:block;width:100%;height:auto;overflow:visible}}
-.lbl{{font:11px var(--mono);fill:var(--faint);text-anchor:end}}
-.tick{{font:10px var(--mono);fill:var(--faint);text-anchor:middle}}
-.grid{{stroke:var(--grid);stroke-width:1}}
-.life{{fill:var(--line)}}
-.talk{{fill:var(--talk)}} .wait{{fill:var(--wait)}} .conc{{fill:var(--conc)}}
-.key{{display:flex;gap:16px;font-size:12px;color:var(--muted);margin-top:10px;align-items:center}}
-.key i{{width:12px;height:12px;border-radius:2px;display:inline-block;margin-right:5px;vertical-align:-2px}}
-h2{{font-size:13px;color:var(--muted);margin:22px 0 6px;font-weight:600}}
+--wait:#E0A33C;--conc:#3D5570}}
+body{margin:0;padding:28px;background:var(--paper);color:var(--ink);font-family:var(--sans)}
+.wrap{max-width:1060px;margin:0 auto}
+h1{font-size:18px;margin:0 0 4px}
+.sub{color:var(--muted);font-size:13px;margin:0 0 18px;font-family:var(--mono)}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:18px;margin-bottom:16px}
+.kpi{display:flex;gap:26px;flex-wrap:wrap;margin-bottom:16px}
+.kpi div{font-size:13px;color:var(--muted)}
+.kpi b{display:block;font-size:20px;color:var(--ink);font-family:var(--mono);font-weight:600}
+svg{display:block;width:100%;height:auto;overflow:visible}
+.lbl{font:11px var(--mono);fill:var(--faint);text-anchor:end}
+.tick{font:10px var(--mono);fill:var(--faint);text-anchor:middle}
+.grid{stroke:var(--grid);stroke-width:1}
+.life{fill:var(--line)}
+.talk{fill:var(--talk)} .wait{fill:var(--wait)} .conc{fill:var(--conc)}
+.key{display:flex;gap:16px;font-size:12px;color:var(--muted);margin-top:10px;align-items:center}
+.key i{width:12px;height:12px;border-radius:2px;display:inline-block;margin-right:5px;vertical-align:-2px}
+h2{font-size:13px;color:var(--muted);margin:22px 0 6px;font-weight:600}
 """
 
 
@@ -253,7 +253,9 @@ def main() -> None:
         d = parse_text(body)
         if not d["events"]:          # a point that never logged a chunk
             continue
-        cards.append(chart(d, name or title))
+        # a single-section log would otherwise repeat the page's own <h1> as a
+        # second, identical <h2> right below it — only sweep points get a header
+        cards.append(chart(d, name if len(secs) > 1 else ""))
     if not cards:
         raise SystemExit("로그에서 청크 줄을 찾지 못했다 — run_local.py 로그가 맞는지 확인할 것")
     out.write_text(page(title, cards), encoding="utf-8")
