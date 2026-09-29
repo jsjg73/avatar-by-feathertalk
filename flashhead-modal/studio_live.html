@@ -1,0 +1,177 @@
+<!doctype html><meta charset="utf-8">
+<title>FeatherTalk 실시간 대화 데모</title>
+<style>
+  body{background:#0b0d10;color:#e8eaed;font-family:-apple-system,sans-serif;margin:0;padding:20px}
+  h1{font-size:16px;font-weight:600;margin:0 0 12px}
+  video{width:480px;max-width:100%;background:#000;border-radius:10px;display:block;margin-bottom:14px}
+  .row{display:flex;gap:8px;max-width:480px}
+  input[type=text]{flex:1;padding:10px 12px;border-radius:8px;border:none;background:#16191d;color:#e8eaed;font-size:14px}
+  button{padding:10px 18px;border-radius:8px;border:none;background:#3378d8;color:#fff;font-weight:600;cursor:pointer}
+  button:disabled{background:#3a3f44;color:#8a9096}
+  #log{margin-top:14px;max-width:480px;font-size:13px;color:#9aa0a6;white-space:pre-wrap;line-height:1.6}
+  .me{color:#5b9bd8}
+  .avatar{color:#e8b04b}
+  .fixed{display:flex;flex-wrap:wrap;gap:6px;max-width:480px;margin-bottom:14px}
+  .fixed button{background:#2a2f36;font-weight:400;font-size:12px;padding:6px 10px}
+  #latency{font-family:ui-monospace,monospace;font-size:12px;color:#9aa0a6;margin-bottom:10px}
+</style>
+<h1>FeatherTalk 실시간 대화 데모</h1>
+<video id="v" autoplay muted playsinline></video>
+<div class="row" style="margin-bottom:14px">
+  <button id="unmute">🔇 소리 켜기</button>
+</div>
+<div class="fixed" id="fixedLines"></div>
+<div id="latency"></div>
+<div class="row">
+  <input id="msg" type="text" placeholder="아바타에게 말할 내용을 입력하세요" autofocus>
+  <button id="send">보내기</button>
+  <button id="speakDirect" style="background:#3a3f44">이 텍스트 그대로 말하기</button>
+</div>
+<div id="log"></div>
+<script>
+const video = document.getElementById('v');
+const MIME = 'video/mp4; codecs="avc1.64001f,mp4a.40.2"';
+
+// A tab that gets backgrounded/throttled (or hits any network hiccup) falls
+// behind the live edge and, with nothing here to correct it, stays exactly
+// that far behind forever -- every new utterance keeps showing up N seconds
+// "late" even though the server reacted instantly. This loop periodically
+// snaps playback back to the live edge whenever it drifts past a threshold,
+// and trims old buffered data so memory doesn't grow unbounded over a
+// long-lived session.
+const MAX_DRIFT_S = 0.75;
+const TRIM_KEEP_S = 5;
+
+function startStream() {
+  const ms = new MediaSource();
+  video.src = URL.createObjectURL(ms);
+  ms.addEventListener('sourceopen', () => {
+    const sb = ms.addSourceBuffer(MIME);
+    sb.mode = 'sequence';
+    const pending = [];
+    let closed = false;
+
+    function pump() {
+      if (sb.updating || !pending.length) return;
+      try { sb.appendBuffer(pending.shift()); }
+      catch (e) { console.error('appendBuffer failed', e); }
+    }
+    sb.addEventListener('updateend', pump);
+
+    setInterval(() => {
+      if (sb.updating || video.buffered.length === 0) return;
+      const liveEdge = video.buffered.end(video.buffered.length - 1);
+      const drift = liveEdge - video.currentTime;
+      if (drift > MAX_DRIFT_S) {
+        console.warn(`live-edge drift ${drift.toFixed(2)}s -- seeking back to live`);
+        video.currentTime = Math.max(0, liveEdge - 0.1);
+      }
+      const trimEnd = video.currentTime - TRIM_KEEP_S;
+      if (trimEnd > video.buffered.start(0)) {
+        try { sb.remove(0, trimEnd); } catch (e) { /* ignore */ }
+      }
+    }, 1000);
+
+    const ws = new WebSocket('ws://116.127.115.27:51853/ws');
+    ws.binaryType = 'arraybuffer';
+    ws.onmessage = (e) => { pending.push(new Uint8Array(e.data)); pump(); };
+    ws.onclose = () => { if (!closed) { closed = true; setTimeout(startStream, 1000); } };
+    ws.onerror = () => ws.close();
+  });
+  video.play().catch(() => {});
+}
+startStream();
+setInterval(() => { if (video.paused) video.play().catch(() => {}); }, 2000);
+
+const unmuteBtn = document.getElementById('unmute');
+unmuteBtn.addEventListener('click', () => {
+  video.muted = !video.muted;
+  unmuteBtn.textContent = video.muted ? '🔇 소리 켜기' : '🔊 소리 끄기';
+});
+
+const log = document.getElementById('log');
+const input = document.getElementById('msg');
+const send = document.getElementById('send');
+
+async function sendMessage() {
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = '';
+  send.disabled = true;
+  log.innerHTML += `<div class="me">나: ${text}</div>`;
+  log.innerHTML += `<div id="pending">아바타: (생각 중...)</div>`;
+  try {
+    const res = await fetch('/chat', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({message: text})
+    });
+    const data = await res.json();
+    document.getElementById('pending').outerHTML = `<div class="avatar">아바타: ${data.reply}</div>`;
+  } catch (e) {
+    document.getElementById('pending').outerHTML = `<div class="avatar">(오류: ${e})</div>`;
+  }
+  send.disabled = false;
+  input.focus();
+}
+send.addEventListener('click', sendMessage);
+input.addEventListener('keydown', e => { if (e.key === 'Enter') sendMessage(); });
+
+const speakDirectBtn = document.getElementById('speakDirect');
+async function speakDirect() {
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = '';
+  speakDirectBtn.disabled = true;
+  log.innerHTML += `<div class="me">나 (그대로 말하기): ${text}</div>`;
+  try {
+    const res = await fetch('/speak_text', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({text})
+    });
+    const data = await res.json();
+    log.innerHTML += `<div class="avatar">(TTS ${data.timing.tts_s}s + 업로드 ${data.timing.upload_s}s)</div>`;
+  } catch (e) {
+    log.innerHTML += `<div class="avatar">(오류: ${e})</div>`;
+  }
+  speakDirectBtn.disabled = false;
+  input.focus();
+}
+speakDirectBtn.addEventListener('click', speakDirect);
+
+const FIXED_LINES = [
+  '안녕하세요 반갑습니다. 오늘 이렇게 만나 뵙게 되어 정말 기쁩니다. 편하게 이야기 나눠요.',
+  '오늘 날씨가 정말 좋네요. 하늘도 맑고 바람도 선선해서 산책하기 딱 좋은 날씨인 것 같아요.',
+  '그건 정말 좋은 질문이네요. 저도 그 부분에 대해 한번 더 생각해보게 되는 것 같아요. 같이 답을 찾아볼까요.',
+  '잠시만 기다려 주세요. 지금 내용을 확인하고 있으니 조금만 시간을 주시면 감사하겠습니다.',
+  '네 맞습니다 그렇게 생각해요. 말씀하신 부분이 정확히 제가 느꼈던 지점과 비슷한 것 같습니다.',
+  '조금 더 자세히 설명해 드릴게요. 이 부분은 처음 들으면 헷갈릴 수 있는데 차근차근 짚어드릴게요.',
+  '정말 흥미로운 이야기네요. 이런 이야기는 들을 때마다 새로운 걸 배우는 기분이 들어서 좋아요.',
+  '저도 그 부분이 궁금했어요. 비슷한 고민을 하고 계셨다니 왠지 반가운 마음이 드네요.',
+  '좋은 하루 보내고 계신가요. 오늘 하루도 무탈하게, 그리고 즐겁게 지나가고 있으면 좋겠습니다.',
+  '다음 질문으로 넘어가겠습니다. 앞서 말씀해주신 내용은 잘 들었고, 이제 다른 주제로 이야기해볼게요.',
+];
+const fixedDiv = document.getElementById('fixedLines');
+const latencyDiv = document.getElementById('latency');
+FIXED_LINES.forEach((text, idx) => {
+  const btn = document.createElement('button');
+  btn.textContent = text;
+  btn.addEventListener('click', () => sendFixed(idx, text));
+  fixedDiv.appendChild(btn);
+});
+
+async function sendFixed(idx, text) {
+  latencyDiv.textContent = `"${text}" 전송 중...`;
+  const t0 = performance.now();
+  try {
+    const res = await fetch('/speak_fixed', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({idx})
+    });
+    const data = await res.json();
+    const t1 = performance.now();
+    latencyDiv.textContent = `"${text}" 업로드+큐잉: ${((t1 - t0) / 1000).toFixed(2)}초 (오디오 ${data.queued.seconds}초 분량) — 화면 반영은 육안으로 확인`;
+  } catch (e) {
+    latencyDiv.textContent = `오류: ${e}`;
+  }
+}
+</script>
