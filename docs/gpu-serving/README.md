@@ -50,6 +50,14 @@ producer-consumer 구조의 **절반만** (예: CPU 전처리를 병렬 워커�
 
 ---
 
+## 5. N개를 실제로 동시에 띄웠을 때만 나오는 함정 둘
+
+**(a) 워커별 리소스 경로를 `os.getcwd()`만으로 만들지 마라.** N개 워커가 같은 cwd 에서 뜨면 전부 똑같은 경로로 계산되고, 그 경로를 시작할 때마다 "안의 파일 전부 지우고 새로 생성"하는 코드가 있으면 **나중에 뜬 워커가 먼저 뜬 워커의 FIFO/소켓/파일을 지워버리고 자기 걸로 바꿔치기**한다. 증상은 CPU/메모리 경합처럼 보이는 산발적 데이터 오염(FeatherTalk 사례에서는 서로 다른 워커의 영상 프레임이 섞여서 화면이 깨짐)이라 진단이 오래 걸린다. N=1 로 혼자 띄우면 절대 안 나타난다. 해결: 워커별 리소스 경로엔 반드시 포트나 PID 같은 그 워커만의 고유값을 넣는다. "혼자 띄우면 멀쩡한데 여러 개를 같이 띄우면 서로 오염되는" 증상을 보면 CPU/메모리 이론보다 공유 경로부터 의심한다.
+
+**(b) 프로세스/스레드 수를 늘리기 전에 컨테이너의 cgroup `pids.max`를 확인한다** (`cat /sys/fs/cgroup/pids.max`, `pids.current`). `ulimit -u`는 "unlimited"라고 나와도 Docker 컨테이너 자체에 호스트가 건 상한이 따로 있을 수 있다. GPU 워커 하나가 BLAS/OMP/torch 스레드를 여러 개씩 만드므로, N이 커지면 이 상한에 먼저 걸린다 — 증상은 `pthread_create failed: Resource temporarily unavailable`, `bash: fork: retry` 같은 일반적인 자원 부족 메시지라 원인 파악이 늦어진다. 렌트한 박스마다 호스트가 달라 이 값도 다를 수 있으니, 새 박스를 빌릴 때마다 다시 확인한다.
+
+---
+
 ## 관련
 
 - Claude Code 세션 메모리: `feedback-gpu-multi-request-serving` — 같은 내용의 Claude Code 전용 기록, FeatherTalk 실측 수치(N≤8 → N≤24, 3배) 포함.
