@@ -1,0 +1,15 @@
+diff --git a/inference.py b/inference.py
+index d6dfea7..67174ac 100644
+--- a/inference.py
++++ b/inference.py
+@@ -137,7 +137,9 @@ def paste_prediction(
+ 
+ def run(args: argparse.Namespace, device: torch.device | None = None) -> None:
+     device = device or torch.device(
+-        "cuda" if torch.cuda.is_available() else "cpu"
++        "cuda" if torch.cuda.is_available()
++        else "mps" if torch.backends.mps.is_available()
++        else "cpu"
+     )
+     features = np.load(args.audio_feat).astype(np.float32)
+     image_dir = os.path.join(args.dataset, "full_body_img")
