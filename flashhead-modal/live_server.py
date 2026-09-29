@@ -364,7 +364,13 @@ def main() -> None:
     first_image = cv2.imread(os.path.join(image_dir, "0.jpg"))
     height, width = first_image.shape[:2]
 
-    hls_dir = os.path.join(os.getcwd(), "hls_live")
+    # Must be unique per process -- _make_fifos deletes every file in this
+    # directory on startup, and gateway.py launches N of these workers from
+    # the same cwd. A shared "hls_live" path meant each new worker's startup
+    # deleted whatever FIFOs an already-running worker was using, splicing
+    # its video/audio into the wrong pipe -- this was the actual cause of
+    # the frame corruption seen under N=24 concurrency, not memory pressure.
+    hls_dir = os.path.join(os.getcwd(), f"hls_live_{args.port}")
     vfifo, afifo = _make_fifos(hls_dir)
 
     STATE.update({
