@@ -31,30 +31,35 @@
 
 ## 3. API 표면
 
-제어 평면(세션 시작/종료)과 미디어 평면(fMP4 WS 스트림)을 분리한다 — `live_server.py`가 이미 이 모양이다(`/speak`와 `/ws`가 분리돼 있음), 세션 개념만 더한다.
+제어 평면(세션 시작/종료/발화)과 미디어 평면(fMP4 WS 스트림)을 분리한다. §8의 최종 확인(문장 단위 청크로 충분, 서브-문장 스트리밍 불필요)을 반영한 **최종 계약**:
 
 ```
 POST /sessions
   { "avatar": "kjs" }   # 파일럿은 아바타 1개 고정이라 생략 가능해도 됨
-  -> { "session_id": "...", "media_ws_url": "ws://.../sessions/{id}/ws" }
-     # 게이트웨이가 빈 워커를 배정하고, 그 워커의 /ws를 세션별 경로로 프록시/리다이렉트
+  -> 200 { "session_id": "..." }
+  -> 503 { "error": "no_capacity" }   # 24슬롯 다 찼을 때, 큐잉 없이 즉시 거절 (§6 확인 결과)
 
-WS /sessions/{id}/audio
-  클라이언트 -> 서버: 바이너리 프레임, PCM16 mono 16kHz 청크, 스트리밍 도착 그대로 전달
-    (TTS가 실시간 스트리밍 PCM 확정 — §8에서 live_server.py의 "완성된 WAV 업로드"를 이 스트리밍 방식으로 바꿔야 함)
-  서버 -> 클라이언트: {"event": "chunk", "k": int, "speech": bool, "gen_s": float, "behind_s": float}  (관측용)
+POST /sessions/{id}/speak
+  발화 조각(part) 하나 = 완성된 WAV 파일 하나 (multipart, live_server.py의 /speak와 동일).
+  한 턴 안에서 여러 조각을 순서대로 여러 번 호출 — 워커 안에서 큐에 쌓여 순서대로 재생된다.
+  -> { "queued_frames": int, "seconds": float }
 
-WS /sessions/{id}/ws
-  서버 -> 클라이언트: fMP4 fragment 바이너리 스트림 (live_server.py의 /ws와 동일 프로토콜 — init segment 먼저, 이후 fragment마다)
+POST /sessions/{id}/interrupt
+  바지인 인터럽트 — 배정된 워커의 대기 큐를 비운다(재생 중인 조각은 자연스럽게 끝까지 재생하거나, 즉시 끊을지는
+  §9에서 정할 구현 디테일). 서브-문장 단위로 자를 필요는 없다는 게 issue #1 최종 확인.
+
+GET /sessions/{id}/ws  (WebSocket)
+  서버 -> 클라이언트: fMP4 fragment 바이너리 스트림, 게이트웨이가 배정된 워커의 /ws에 붙어 그대로 릴레이
+    (init segment 먼저, 이후 fragment마다 — live_server.py의 /ws와 동일 프로토콜)
 
 POST /sessions/{id}/end
-  -> 남은 오디오를 마지막 청크로 밀어넣고 세션 종료
+  -> 세션 종료, 워커를 정지 상태로 되돌려 워커 풀에 반납
 
 GET /sessions/{id}
-  -> { "status": "running"|"ended", "chunks": int, ... }
+  -> { "status": "running"|"ended", "speaking": bool, "pending": bool }  (워커의 /status를 그대로 프록시)
 ```
 
-**슬롯 초과 시**: `POST /sessions`가 24개 슬롯이 다 찬 상태면 즉시 `503`으로 거절한다(§6 확인 결과 — 큐잉 안 함).
+게이트웨이가 HTTP(`/speak`,`/interrupt`,`/end`,`GET`)와 WS(`/ws`) 둘 다 프록시하는 이유: Vast.ai 박스는 보통 공인 포트 하나(또는 소수)만 매핑돼 있어서, 워커 24개의 포트를 전부 외부에 열어야 하는 구조보다 게이트웨이 포트 하나만 열면 되는 쪽이 실제 배포에 맞다.
 
 ## 4. 프로세스 구조 — 게이트웨이 + N-프로세스 워커 풀
 

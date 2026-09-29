@@ -28,6 +28,7 @@ import sys
 import threading
 import time
 import wave
+from collections import deque
 
 import cv2
 import numpy as np
@@ -206,10 +207,12 @@ def _audio_writer(afifo: str, q: "queue.Queue[bytes]") -> None:
 
 
 def _gen_loop() -> None:
-    """Runs at 25 fps. Checks STATE["next"] every frame (not just when idle)
-    so a fresh /speak call always barge-in-interrupts whatever is currently
-    playing -- a real-time avatar shouldn't finish a queued backlog before
-    reacting to the newest thing it was told to say."""
+    """Runs at 25 fps. Speech parts queue in order within a turn (a reply is
+    often several parts -- filler, backchannel, the actual answer -- each its
+    own /speak call, and they should play back to back, not interrupt each
+    other). A genuine barge-in (the candidate starts talking) is a separate,
+    explicit /interrupt call that clears both the queue and whatever is
+    currently playing -- see interrupt()."""
     s = STATE
     silence = b"\x00\x00" * SAMPLES_PER_FRAME
     idle_frame = cv2.imread(os.path.join(s["image_dir"], f"{s['idle_frame_idx']}.jpg"))
@@ -220,10 +223,13 @@ def _gen_loop() -> None:
         t0 = time.time()
 
         with s["lock"]:
-            nxt = s["next"]
-            s["next"] = None
-        if nxt is not None:
-            current = nxt
+            if s["interrupt"]:
+                s["queue"].clear()
+                current = None
+                s["interrupt"] = False
+            elif current is None and s["queue"]:
+                current = s["queue"].popleft()
+        if current is not None and not s["speaking"]:
             s["speaking"] = True
             print(f"[live] speaking: {current['n_frames']} frames", flush=True)
 
@@ -314,8 +320,18 @@ async def speak(file: UploadFile):
 
     n_frames = features.shape[0]
     with STATE["lock"]:
-        STATE["next"] = {"features": features, "pcm": pcm, "idx": 0, "n_frames": n_frames}
+        STATE["queue"].append({"features": features, "pcm": pcm, "idx": 0, "n_frames": n_frames})
     return {"queued_frames": n_frames, "seconds": n_frames / FPS}
+
+
+@app.post("/interrupt")
+def interrupt():
+    """Barge-in: drop whatever is queued or currently playing. Not sub-part
+    granular -- the candidate starting to talk means "stop everything now",
+    not "finish this one queued clip first"."""
+    with STATE["lock"]:
+        STATE["interrupt"] = True
+    return {"ok": True}
 
 
 def _extract_features(wav_path: str) -> np.ndarray:
@@ -329,7 +345,7 @@ def _extract_features(wav_path: str) -> np.ndarray:
 
 @app.get("/status")
 def status():
-    return {"speaking": STATE.get("speaking", False), "pending": STATE.get("next") is not None}
+    return {"speaking": STATE.get("speaking", False), "pending": len(STATE.get("queue", []))}
 
 
 def main() -> None:
@@ -359,7 +375,8 @@ def main() -> None:
         "fh_model": _fh.load_feather_hubert(args.fh_checkpoint, device=device),
         "picker": FramePicker(frame_count),
         "idle_frame_idx": args.idle_frame,
-        "next": None,
+        "queue": deque(),
+        "interrupt": False,
         "speaking": False,
         "lock": threading.Lock(),
         "video_q": queue.Queue(),
