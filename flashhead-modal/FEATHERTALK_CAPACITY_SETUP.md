@@ -98,24 +98,36 @@ python sweep_concurrent.py \
 
 벤치마크(1~6)가 끝나 N=24 가 검증된 이후, 실제 세션을 처리하려면 `gateway.py`가 `live_server.py` 워커 N개를 띄우고 그 앞에서 세션을 배정한다. 설계 배경은 [`docs/live-serving/DESIGN.md`](../docs/live-serving/DESIGN.md).
 
+**`--port`는 그 박스가 실제로 공인 노출한 포트로 맞춰야 한다** — Vast 인스턴스는 기본적으로 컨테이너 포트 중 미리 매핑된 것 하나(보통 `8000/tcp`)만 공인 IP:포트로 열려 있다. 다른 포트로 띄우면 게이트웨이 자체는 멀쩡히 돌아도 박스 밖에서는 아무도 못 붙는다 — 처음 이걸 8080으로 띄웠다가 겪은 실수다. 실제 매핑은:
+
+```bash
+python3 -c "
+import box, json
+p = box.VastProvider()
+for i in p._instances():
+    if i.get('actual_status') == 'running':
+        print(i['id'], i.get('public_ipaddr'), i.get('ports'))
+"
+```
+
 ```bash
 python gateway.py \
     --dataset data/kjs --checkpoint ckpt_full/last.pth --fh_checkpoint feather_hubert.pth \
-    --workers 24 --base_port 9000 --port 8080
+    --workers 24 --base_port 9000 --port 8000
 ```
 
-워커 24개가 순차로 뜨고(모델 로드 시간만큼), 전부 `/status` 응답이 올 때까지 게이트웨이가 기다린 뒤에야 `8080`에서 요청을 받기 시작한다. 세션 생성은:
+워커 24개가 순차로 뜨고(모델 로드 시간만큼), 전부 `/status` 응답이 올 때까지 게이트웨이가 기다린 뒤에야 `8000`에서 요청을 받기 시작한다. 세션 생성은:
 
 ```bash
-curl -X POST http://localhost:8080/sessions          # -> {"session_id": "..."}
-curl -X POST http://localhost:8080/sessions/<id>/speak -F file=@line.wav
-# WebSocket ws://localhost:8080/sessions/<id>/ws 로 fMP4 스트림 수신 (studio_live.html의 클라이언트 패턴 재사용)
-curl -X POST http://localhost:8080/sessions/<id>/end
+curl -X POST http://localhost:8000/sessions          # -> {"session_id": "..."}
+curl -X POST http://localhost:8000/sessions/<id>/speak -F file=@line.wav
+# WebSocket ws://localhost:8000/sessions/<id>/ws 로 fMP4 스트림 수신 (studio_live.html의 클라이언트 패턴 재사용)
+curl -X POST http://localhost:8000/sessions/<id>/end
 ```
 
 24슬롯이 다 찬 상태에서 `POST /sessions`는 큐잉 없이 즉시 `503 {"error": "no_capacity"}`.
 
-**아직 실제 박스에서 엔드투엔드로 검증 안 함** — 로컬(macOS, GPU 없음)에서는 문법 확인(`python3 -m py_compile`)까지만 했다. 실제 검증 항목: 워커 24개 동시 기동이 메모리/기동 시간 안에 끝나는지, WS 릴레이 지연이 눈에 띄는지, 세션 종료 후 워커 재사용이 깨끗한지.
+**2026-09-29 실제 박스(RTX 4090)에서 엔드투엔드 검증 완료**: 워커 24개 전체 기동, 세션 생성/발화 큐잉/용량 초과 거절/WS 미디어 릴레이(실제 립싱크 프레임 수신 확인)까지 전부 통과. 공인 IP:포트(위 `ports` 조회로 확인)로 박스 밖에서 직접 호출해서 확인했다.
 
 ## 되짚어볼 것
 
