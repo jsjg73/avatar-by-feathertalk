@@ -9,6 +9,15 @@
 - 원본 아바타 영상 (`train.mp4`, 25fps 필수) — git에 없다. 로컬에 보관된 원본을 박스로 올려야 한다.
 - 체크포인트 `last.pth`/`59.pth` — 이 저장소의 `flashhead-modal/checkpoints_featherhead_kjs/` 에 커밋되어 있다.
 - FeatherTalk 코드 — 업스트림 클론이라 이 저장소에는 없다 (`.gitignore` 로 `/model-repos/` 전체 제외).
+- **Vast.ai 자격증명 — 저장소에 없고, 각자 새로 만들어야 한다.** 아래 셋:
+  1. [vast.ai](https://vast.ai) 계정 + API 키 → `~/.vast_key` 에 저장(`chmod 600`) 하거나 `$VAST_API_KEY` 환경변수로 설정.
+  2. 이 박스 대여 전용 SSH 키페어. 없으면 `python box.py rent vast ...` 실행 시 `box.py` 가 만들 명령어를 직접 알려준다 (내부적으로 `~/.ssh/vast_flashhead` 를 찾는다):
+     ```bash
+     ssh-keygen -t ed25519 -N '' -C flashhead-rented-gpu -f ~/.ssh/vast_flashhead
+     ```
+  3. 위 둘 다 **레포 밖(홈 디렉터리)에 두는 게 의도된 설계** — `box.py` 코드에도 커밋되지 않고, git에 실수로 딸려갈 일이 없다.
+
+  Modal/Lightning 벤더를 쓸 경우엔 각각 `MODAL_TOKEN_ID`/`MODAL_TOKEN_SECRET`, `LIGHTNING_API_KEY` 가 같은 방식(환경변수)으로 필요하다 — FeatherTalk 벤치마킹 자체는 Vast만 쓰므로 해당 없음.
 
 ## 1. FeatherTalk 클론 + 패치
 
