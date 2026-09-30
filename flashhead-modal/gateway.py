@@ -199,6 +199,16 @@ async def media_ws(websocket: WebSocket, session_id: str):
     try:
         async with websockets.connect(upstream_url, max_size=None) as upstream:
             while True:
+                if session_id not in SESSIONS:
+                    # /end deletes the session but this loop was already
+                    # blocked in upstream.recv() -- without this check it
+                    # keeps relaying forever, and once the freed worker port
+                    # is handed to a NEW session, a stale client ends up
+                    # watching that session's stream instead of getting cut
+                    # off (reported by ai-interview-avatar-proto: /end
+                    # returned ok but /ws kept sending frames 12+ minutes
+                    # later).
+                    break
                 frag = await upstream.recv()
                 await websocket.send_bytes(frag)
     except Exception as exc:
