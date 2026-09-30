@@ -21,6 +21,7 @@ Usage:
 
 import argparse
 import asyncio
+import json
 import os
 import queue
 import subprocess
@@ -216,8 +217,11 @@ def _gen_loop() -> None:
     s = STATE
     silence = b"\x00\x00" * SAMPLES_PER_FRAME
     idle_frame = cv2.imread(os.path.join(s["image_dir"], f"{s['idle_frame_idx']}.jpg"))
+    idle_cache = s.get("idle_cache")  # shared memmap of a natural idle-loop range, or None for the old static frame
+    idle_loop_pos = 0
     current = None
     last_idle_heartbeat = 0.0
+    idle_interval = 1.0 / s["idle_fps"]
 
     while True:
         t0 = time.time()
@@ -233,12 +237,13 @@ def _gen_loop() -> None:
             s["speaking"] = True
             print(f"[live] speaking: {current['n_frames']} frames", flush=True)
 
-        if current is None and (t0 - last_idle_heartbeat) < 1.0:
+        if current is None and (t0 - last_idle_heartbeat) < idle_interval:
             # A full stop breaks the muxer -- frag_keyframe closes a fragment
             # only when the NEXT keyframe arrives, so one idle frame then
             # silence forever leaves ffmpeg stuck without ever emitting even
-            # the init segment. A once-a-second heartbeat keeps fragments
-            # closing while still cutting idle CPU/bitrate by ~25x vs 25fps.
+            # the init segment. Throttling to idle_fps (instead of the full
+            # 25) keeps idle CPU/bitrate down while an idle_cache loop still
+            # reads as slow, natural motion rather than a single frozen frame.
             time.sleep(1.0 / FPS)
             continue
         if current is None:
@@ -267,6 +272,10 @@ def _gen_loop() -> None:
             if current["idx"] >= current["n_frames"]:
                 current = None
                 s["speaking"] = False
+        elif idle_cache is not None:
+            frame = idle_cache[idle_loop_pos].copy()  # copy: memmap is shared read-only across workers
+            idle_loop_pos = (idle_loop_pos + 1) % idle_cache.shape[0]
+            pcm_chunk = silence
         else:
             frame = idle_frame
             pcm_chunk = silence
@@ -352,7 +361,12 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--dataset", required=True)
     p.add_argument("--checkpoint", required=True)
-    p.add_argument("--idle_frame", type=int, default=0, help="resource frame index to hold on while idle")
+    p.add_argument("--idle_frame", type=int, default=0, help="resource frame index to hold on while idle, if no --idle_cache is given")
+    p.add_argument("--idle_cache", action="store_true",
+                   help="use the shared idle-loop cache (data/kjs/idle_cache.raw, built by build_idle_cache.py) "
+                        "instead of a single static idle frame")
+    p.add_argument("--idle_fps", type=float, default=9.0, help="idle-loop playback rate; throttled well below 25 "
+                   "since it's just a slow natural-motion loop, not real speech")
     p.add_argument("--fh_checkpoint", type=str, default="./feather_hubert.pth")
     p.add_argument("--port", type=int, default=8000)
     args = p.parse_args()
@@ -373,6 +387,15 @@ def main() -> None:
     hls_dir = os.path.join(os.getcwd(), f"hls_live_{args.port}")
     vfifo, afifo = _make_fifos(hls_dir)
 
+    idle_cache = None
+    idle_desc = f"static idle frame #{args.idle_frame}"
+    if args.idle_cache:
+        with open(os.path.join(args.dataset, "idle_cache.meta.json")) as f:
+            idle_meta = json.load(f)
+        idle_shape = (idle_meta["frame_count"], idle_meta["height"], idle_meta["width"], idle_meta["channels"])
+        idle_cache = np.memmap(os.path.join(args.dataset, "idle_cache.raw"), dtype=np.uint8, mode="r", shape=idle_shape)
+        idle_desc = f"shared idle-loop cache ({idle_meta['frame_count']} frames, resource {idle_meta['resource_start']}-{idle_meta['resource_end']}) at {args.idle_fps} fps"
+
     STATE.update({
         "device": device,
         "image_dir": image_dir,
@@ -381,6 +404,8 @@ def main() -> None:
         "fh_model": _fh.load_feather_hubert(args.fh_checkpoint, device=device),
         "picker": FramePicker(frame_count),
         "idle_frame_idx": args.idle_frame,
+        "idle_cache": idle_cache,
+        "idle_fps": args.idle_fps,
         "queue": deque(),
         "interrupt": False,
         "speaking": False,
@@ -391,7 +416,7 @@ def main() -> None:
         "init_segment": None,
     })
 
-    print(f"[live] {frame_count} resource frames, {width}x{height}, idle frame #{args.idle_frame}", flush=True)
+    print(f"[live] {frame_count} resource frames, {width}x{height}, {idle_desc}", flush=True)
 
     ffmpeg_proc = _start_ffmpeg(hls_dir, vfifo, afifo, width, height)
     STATE["ffmpeg"] = ffmpeg_proc

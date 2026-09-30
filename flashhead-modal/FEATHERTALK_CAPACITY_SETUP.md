@@ -134,6 +134,27 @@ curl -X POST http://localhost:8000/sessions/<id>/end
 
 **2026-09-29 실제 박스(RTX 4090)에서 엔드투엔드 검증 완료**: 워커 24개 전체 기동, 세션 생성/발화 큐잉/용량 초과 거절/WS 미디어 릴레이(실제 립싱크 프레임 수신 확인)까지 전부 통과. 공인 IP:포트(위 `ports` 조회로 확인)로 박스 밖에서 직접 호출해서 확인했다.
 
+## 7.5. Idle 화면 — 말하지 않을 때의 자연스러운 반복 루프
+
+기본은 정지 프레임(`--idle_frame`, 기본 0번) 1장을 낮은 fps로 반복해 보여주는 것 — 이건 추가 준비 없이 그냥 된다. **자연스럽게 반복되는 idle 모션**을 쓰려면 먼저 공유 캐시를 만들어야 한다 (`docs/live-serving/DESIGN.md` §12에 이 프레임 구간을 어떻게 골랐는지 있음 — kjs 데이터셋 기준 4565-4643):
+
+```bash
+python build_idle_cache.py --dataset data/kjs --start 4565 --end 4643
+```
+
+`data/kjs/idle_cache.raw`(+`.meta.json`) 생성 — `build_frame_cache.py`와 같은 `np.memmap` 공유 패턴이라, 워커 24개가 이 캐시를 각자 들지 않고 공유한다(총 ~410MB, 24배 아님).
+
+게이트웨이에 `--idle_cache` 플래그를 추가하면 모든 워커에 전달된다:
+
+```bash
+python gateway.py \
+    --dataset data/kjs --checkpoint ckpt_full/last.pth --fh_checkpoint feather_hubert.pth \
+    --workers 24 --base_port 9000 --port 8000 \
+    --idle_cache --idle_fps 9
+```
+
+`--idle_fps`(기본 9)는 25로 안 올린다 — 진짜 발화가 아니라 느린 자연스러운 움직임(호흡·깜박임 정도)이라 그 정도로 충분하고, ffmpeg 인코딩 부하를 낮게 유지한다.
+
 ## 되짚어볼 것
 
 이 절차 전체를 1~6 순서대로 실행하는 셋업 스크립트(`setup_box.sh`)로 묶으면 사람이 순서를 기억할 필요가 없어진다 — 아직 안 만들었다.
