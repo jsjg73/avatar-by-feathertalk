@@ -70,16 +70,33 @@ async def _wait_ready(port: int) -> None:
 async def _spawn_pool(n: int, base_port: int, dataset: str, checkpoint: str, fh_checkpoint: str,
                        idle_cache: bool, idle_fps: float) -> None:
     here = os.path.dirname(os.path.abspath(__file__))
+
+    # Left to their own defaults, torch/OpenBLAS/MKL and ffmpeg's libx264
+    # encoder each assume they own every core on the box and size their
+    # thread pools to nproc -- fine for one worker, but N workers doing that
+    # is how a 24-worker box hit its cgroup pids.max (thousands of threads
+    # for a handful of cores actually in use, since the model itself runs on
+    # GPU). Split the box's actual core count across the workers instead of
+    # hardcoding a number -- rented boxes vary a lot (28 cores one rental,
+    # 6 the next), so this must be measured here, not assumed.
+    cores = os.cpu_count() or n
+    threads_per_worker = max(1, cores // n)
+    print(f"[gateway] {cores} CPU cores detected, {n} workers -> {threads_per_worker} thread(s)/worker", flush=True)
+    worker_env = dict(os.environ)
+    worker_env["OMP_NUM_THREADS"] = str(threads_per_worker)
+    worker_env["OPENBLAS_NUM_THREADS"] = str(threads_per_worker)
+    worker_env["MKL_NUM_THREADS"] = str(threads_per_worker)
+
     procs = []
     for i in range(n):
         port = base_port + i
         cmd = [sys.executable, f"{here}/live_server.py",
                "--dataset", dataset, "--checkpoint", checkpoint,
                "--fh_checkpoint", fh_checkpoint, "--port", str(port),
-               "--idle_fps", str(idle_fps)]
+               "--idle_fps", str(idle_fps), "--cpu_threads", str(threads_per_worker)]
         if idle_cache:
             cmd.append("--idle_cache")
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=worker_env)
         procs.append((port, proc))
         print(f"[gateway] worker {i+1}/{n} launched on port {port} (pid {proc.pid})", flush=True)
 

@@ -69,7 +69,7 @@ def _make_fifos(hls_dir: str) -> tuple[str, str]:
     return vfifo, afifo
 
 
-def _start_ffmpeg(hls_dir: str, vfifo: str, afifo: str, width: int, height: int) -> subprocess.Popen:
+def _start_ffmpeg(hls_dir: str, vfifo: str, afifo: str, width: int, height: int, cpu_threads: int) -> subprocess.Popen:
     """Fragmented MP4 to stdout, not HLS files -- a WebSocket relay (see
     _stdout_reader/_ws_broadcast below) pushes each chunk to browsers the
     moment it's produced, instead of them polling a playlist for whole
@@ -93,6 +93,10 @@ def _start_ffmpeg(hls_dir: str, vfifo: str, afifo: str, width: int, height: int)
         # x264 preset speed order is ultrafast < superfast < veryfast < faster
         # < fast < medium -- "faster" and "veryfast" both landed under 1x
         # real-time even at 960px (got the ordering backwards the first try).
+        # Left unset, libx264 defaults to nproc encoder threads -- fine for one
+        # worker alone, but N workers each grabbing nproc threads is how a
+        # 24-worker box hit its cgroup pids.max (see gateway.py _spawn_pool).
+        "-threads", str(cpu_threads),
         "-c:v", "libx264", "-preset", "superfast", "-tune", "zerolatency",
         "-g", "3", "-maxrate", "3M", "-bufsize", "3M",
         "-c:a", "aac", "-b:a", "96k",
@@ -369,8 +373,14 @@ def main() -> None:
                    "since it's just a slow natural-motion loop, not real speech")
     p.add_argument("--fh_checkpoint", type=str, default="./feather_hubert.pth")
     p.add_argument("--port", type=int, default=8000)
+    p.add_argument("--cpu_threads", type=int, default=2,
+                   help="cap torch/ffmpeg CPU threads to this many -- the model runs on GPU regardless, "
+                        "and left at library defaults each worker assumes it owns every core on the box. "
+                        "gateway.py sets this to (detected cores / N workers) when it spawns the pool; "
+                        "the default here is only for running one instance standalone.")
     args = p.parse_args()
 
+    torch.set_num_threads(args.cpu_threads)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     image_dir = os.path.join(args.dataset, "full_body_img")
     landmark_dir = os.path.join(args.dataset, "landmarks")
@@ -418,7 +428,7 @@ def main() -> None:
 
     print(f"[live] {frame_count} resource frames, {width}x{height}, {idle_desc}", flush=True)
 
-    ffmpeg_proc = _start_ffmpeg(hls_dir, vfifo, afifo, width, height)
+    ffmpeg_proc = _start_ffmpeg(hls_dir, vfifo, afifo, width, height, args.cpu_threads)
     STATE["ffmpeg"] = ffmpeg_proc
 
     threading.Thread(target=_video_writer, args=(vfifo, STATE["video_q"]), daemon=True).start()
