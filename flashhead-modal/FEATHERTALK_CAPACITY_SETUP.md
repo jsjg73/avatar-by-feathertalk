@@ -69,6 +69,20 @@ pip install fastapi uvicorn python-multipart httpx websockets
 
 ## 4. 데이터셋 전처리 (프레임 25fps 필수)
 
+**지름길 — 매번 새로 돌리지 않는다.** kjs 데이터셋은 이미 전처리 결과를 [GitHub Release](https://github.com/jsjg73/avatar-by-feathertalk/releases/tag/preprocessed-kjs-v1)에 올려뒀다 (2GB 제한 때문에 2파트로 분할). 박스가 로컬보다 훨씬 빠르게 GitHub에서 받을 수 있다:
+
+```bash
+cd data/kjs
+gh release download preprocessed-kjs-v1 --repo jsjg73/avatar-by-feathertalk --pattern "preprocessed_backup.tar.gz.part-*"
+cat preprocessed_backup.tar.gz.part-aa preprocessed_backup.tar.gz.part-ab > preprocessed_backup.tar.gz
+tar xzf preprocessed_backup.tar.gz
+rm preprocessed_backup.tar.gz preprocessed_backup.tar.gz.part-*
+```
+
+`full_body_img/`, `landmarks/`, `aud_hu.npy`가 생성된다 — `process.py`(15~20분, CPU 랜드마크 검출 병목)를 아예 안 돌려도 된다. (박스에 `gh` 인증이 안 돼 있으면 release URL로 `curl -L`도 가능 — `gh release view ... --json assets`로 다운로드 URL 확인.)
+
+**처음부터 다시 만들어야 할 때만** (다른 아바타 영상 추가 등):
+
 ```bash
 python data_utils/process.py data/kjs/train.mp4 --feather_hubert_checkpoint feather_hubert.pth
 ```
