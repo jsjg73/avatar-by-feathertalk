@@ -150,24 +150,9 @@ curl -X POST http://localhost:8000/sessions/<id>/end
 
 ## 7.5. Idle 화면 — 말하지 않을 때의 자연스러운 반복 루프
 
-기본은 정지 프레임(`--idle_frame`, 기본 0번) 1장을 낮은 fps로 반복해 보여주는 것 — 이건 추가 준비 없이 그냥 된다. **자연스럽게 반복되는 idle 모션**을 쓰려면 먼저 공유 캐시를 만들어야 한다 (`docs/live-serving/DESIGN.md` §12에 이 프레임 구간을 어떻게 골랐는지 있음 — kjs 데이터셋 기준 4565-4643):
+별도 플래그나 사전 빌드가 필요 없다 — `live_server.py`는 항상 켜져 있다. 큐가 비어있으면 `_gen_loop`가 무음 오디오로 **같은 picker, 같은 모델**을 그대로 통과시켜 프레임을 계속 만든다(발화와 렌더링 파이프라인이 완전히 동일). 이전엔 정지 프레임(`--idle_frame`) → 공유 캐시(`--idle_cache`/`--idle_fps`) 순으로 시도했으나, 캐시 방식은 실시간 picker 위치와 어긋나 전환 때 화면이 튀거나 인코더가 순간적으로 블러를 내는 문제가 구조적으로 안 없어져서 폐기했다 — 자세한 경위는 `docs/live-serving/DESIGN.md` §12-13 참고.
 
-```bash
-python build_idle_cache.py --dataset data/kjs --start 4565 --end 4643
-```
-
-`data/kjs/idle_cache.raw`(+`.meta.json`) 생성 — `build_frame_cache.py`와 같은 `np.memmap` 공유 패턴이라, 워커 24개가 이 캐시를 각자 들지 않고 공유한다(총 ~410MB, 24배 아님).
-
-게이트웨이에 `--idle_cache` 플래그를 추가하면 모든 워커에 전달된다:
-
-```bash
-python gateway.py \
-    --dataset data/kjs --checkpoint ckpt_full/last.pth --fh_checkpoint feather_hubert.pth \
-    --workers 24 --base_port 9000 --port 8000 \
-    --idle_cache --idle_fps 9
-```
-
-`--idle_fps`(기본 9)는 25로 안 올린다 — 진짜 발화가 아니라 느린 자연스러운 움직임(호흡·깜박임 정도)이라 그 정도로 충분하고, ffmpeg 인코딩 부하를 낮게 유지한다.
+대가: idle도 더 이상 거의 공짜가 아니다 — 발화와 동일하게 워커당 GPU 2~3%를 쓴다. 24워커가 전부 상시 추론하는 그림은 아직 실측 안 됐다(N=24 스트레스 테스트는 보류 중, 1워커로만 검증 완료).
 
 ## 되짚어볼 것
 

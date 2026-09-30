@@ -67,8 +67,7 @@ async def _wait_ready(port: int) -> None:
     raise RuntimeError(f"worker on port {port} did not become ready within {READY_TIMEOUT_S}s")
 
 
-async def _spawn_pool(n: int, base_port: int, dataset: str, checkpoint: str, fh_checkpoint: str,
-                       idle_cache: bool, idle_fps: float) -> None:
+async def _spawn_pool(n: int, base_port: int, dataset: str, checkpoint: str, fh_checkpoint: str) -> None:
     here = os.path.dirname(os.path.abspath(__file__))
 
     # Left to their own defaults, torch/OpenBLAS/MKL and ffmpeg's libx264
@@ -93,9 +92,7 @@ async def _spawn_pool(n: int, base_port: int, dataset: str, checkpoint: str, fh_
         cmd = [sys.executable, f"{here}/live_server.py",
                "--dataset", dataset, "--checkpoint", checkpoint,
                "--fh_checkpoint", fh_checkpoint, "--port", str(port),
-               "--idle_fps", str(idle_fps), "--cpu_threads", str(threads_per_worker)]
-        if idle_cache:
-            cmd.append("--idle_cache")
+               "--cpu_threads", str(threads_per_worker)]
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=worker_env)
         procs.append((port, proc))
         print(f"[gateway] worker {i+1}/{n} launched on port {port} (pid {proc.pid})", flush=True)
@@ -221,16 +218,11 @@ def main() -> None:
     p.add_argument("--workers", type=int, default=24, help="pool size -- verified safe up to 24 (sweep_concurrent.py)")
     p.add_argument("--base_port", type=int, default=9000, help="workers occupy [base_port, base_port + workers)")
     p.add_argument("--port", type=int, default=8080, help="gateway's own public port")
-    p.add_argument("--idle_cache", action="store_true",
-                   help="pass through to each worker: use the shared idle-loop cache "
-                        "(build_idle_cache.py) instead of a single static idle frame")
-    p.add_argument("--idle_fps", type=float, default=9.0, help="idle-loop playback rate passed to each worker")
     args = p.parse_args()
 
     @app.on_event("startup")
     async def _startup() -> None:
-        await _spawn_pool(args.workers, args.base_port, args.dataset, args.checkpoint, args.fh_checkpoint,
-                           args.idle_cache, args.idle_fps)
+        await _spawn_pool(args.workers, args.base_port, args.dataset, args.checkpoint, args.fh_checkpoint)
 
     uvicorn.run(app, host="0.0.0.0", port=args.port)
 

@@ -21,7 +21,6 @@ Usage:
 
 import argparse
 import asyncio
-import json
 import os
 import queue
 import subprocess
@@ -212,20 +211,25 @@ def _audio_writer(afifo: str, q: "queue.Queue[bytes]") -> None:
 
 
 def _gen_loop() -> None:
-    """Runs at 25 fps. Speech parts queue in order within a turn (a reply is
-    often several parts -- filler, backchannel, the actual answer -- each its
-    own /speak call, and they should play back to back, not interrupt each
-    other). A genuine barge-in (the candidate starts talking) is a separate,
-    explicit /interrupt call that clears both the queue and whatever is
-    currently playing -- see interrupt()."""
+    """Runs at 25 fps, always -- idle is not a separate cheap branch, it's a
+    perpetual silent "utterance" run through the exact same model+picker
+    path as real speech. Earlier versions held idle at a single static frame,
+    then a throttled loop over a pre-recorded quiet clip, then a pre-rendered
+    (once, offline) model loop -- all three had the same flaw: idle content
+    was decoupled from wherever the live picker actually was, so real speech
+    (which roams the whole resource range) always cut to/from a mismatched
+    background/pose, and a pre-rendered clip can't fix that since it can't
+    know in advance where a real session will be when it goes idle. Running
+    inference continuously removes the seam instead of chasing it -- see
+    docs/live-serving/DESIGN.md. Speech parts queue in order within a turn (a
+    reply is often several parts -- filler, backchannel, the actual answer --
+    each its own /speak call, and they should play back to back, not
+    interrupt each other). A genuine barge-in (the candidate starts talking)
+    is a separate, explicit /interrupt call that clears both the queue and
+    whatever is currently playing -- see interrupt()."""
     s = STATE
     silence = b"\x00\x00" * SAMPLES_PER_FRAME
-    idle_frame = cv2.imread(os.path.join(s["image_dir"], f"{s['idle_frame_idx']}.jpg"))
-    idle_cache = s.get("idle_cache")  # shared memmap of a natural idle-loop range, or None for the old static frame
-    idle_loop_pos = 0
     current = None
-    last_idle_heartbeat = 0.0
-    idle_interval = 1.0 / s["idle_fps"]
 
     while True:
         t0 = time.time()
@@ -235,54 +239,44 @@ def _gen_loop() -> None:
                 s["queue"].clear()
                 current = None
                 s["interrupt"] = False
-            elif current is None and s["queue"]:
-                current = s["queue"].popleft()
-        if current is not None and not s["speaking"]:
-            s["speaking"] = True
-            print(f"[live] speaking: {current['n_frames']} frames", flush=True)
+            if current is None or current.get("silent"):
+                # Re-checked every tick while idle (not just once when current
+                # first goes None) -- otherwise a silent placeholder, once
+                # set, never yields back to a real queued utterance and
+                # /speak's clip sits in the queue forever.
+                current = s["queue"].popleft() if s["queue"] else {"silent": True}
 
-        if current is None and (t0 - last_idle_heartbeat) < idle_interval:
-            # A full stop breaks the muxer -- frag_keyframe closes a fragment
-            # only when the NEXT keyframe arrives, so one idle frame then
-            # silence forever leaves ffmpeg stuck without ever emitting even
-            # the init segment. Throttling to idle_fps (instead of the full
-            # 25) keeps idle CPU/bitrate down while an idle_cache loop still
-            # reads as slow, natural motion rather than a single frozen frame.
-            time.sleep(1.0 / FPS)
-            continue
-        if current is None:
-            last_idle_heartbeat = t0
+        speaking_now = not current.get("silent", False)
+        if speaking_now != s["speaking"]:
+            s["speaking"] = speaking_now
+            if speaking_now:
+                print(f"[live] speaking: {current['n_frames']} frames", flush=True)
 
-        if current is not None:
+        resource_index = s["picker"].next()
+        image = cv2.imread(os.path.join(s["image_dir"], f"{resource_index}.jpg"))
+        landmark_path = os.path.join(s["landmark_dir"], f"{resource_index}.lms")
+        model_input, face_crop, bbox, original_size = prepare_model_input(image, landmark_path, s["device"])
+
+        if current.get("silent"):
+            audio_feat = s["idle_audio_feat"]
+            pcm_chunk = silence
+        else:
             i = current["idx"]
             audio_feat = reshape_audio_feat(gather_audio_window(current["features"], i)).unsqueeze(0).to(s["device"])
-            resource_index = s["picker"].next()
-            image = cv2.imread(os.path.join(s["image_dir"], f"{resource_index}.jpg"))
-            landmark_path = os.path.join(s["landmark_dir"], f"{resource_index}.lms")
-            model_input, face_crop, bbox, original_size = prepare_model_input(image, landmark_path, s["device"])
-            with torch.no_grad():
-                prediction = s["model"](model_input, audio_feat)[0]
-            prediction = (prediction.cpu().numpy().transpose(1, 2, 0) * 255.0).clip(0, 255).astype(np.uint8)
-            paste_prediction(image, prediction, face_crop, bbox, original_size)
-            frame = image
-
             a0 = i * SAMPLES_PER_FRAME
             a1 = a0 + SAMPLES_PER_FRAME
             pcm_chunk = current["pcm"][a0 * 2: a1 * 2]
             if len(pcm_chunk) < SAMPLES_PER_FRAME * 2:
                 pcm_chunk = pcm_chunk + b"\x00" * (SAMPLES_PER_FRAME * 2 - len(pcm_chunk))
-
             current["idx"] += 1
             if current["idx"] >= current["n_frames"]:
                 current = None
-                s["speaking"] = False
-        elif idle_cache is not None:
-            frame = idle_cache[idle_loop_pos].copy()  # copy: memmap is shared read-only across workers
-            idle_loop_pos = (idle_loop_pos + 1) % idle_cache.shape[0]
-            pcm_chunk = silence
-        else:
-            frame = idle_frame
-            pcm_chunk = silence
+
+        with torch.no_grad():
+            prediction = s["model"](model_input, audio_feat)[0]
+        prediction = (prediction.cpu().numpy().transpose(1, 2, 0) * 255.0).clip(0, 255).astype(np.uint8)
+        paste_prediction(image, prediction, face_crop, bbox, original_size)
+        frame = image
 
         s["video_q"].put(frame.tobytes())
         s["audio_q"].put(pcm_chunk)
@@ -356,6 +350,25 @@ def _extract_features(wav_path: str) -> np.ndarray:
     return hidden.numpy().astype(np.float32)
 
 
+def _make_idle_audio_feat(device: torch.device) -> torch.Tensor:
+    """Silence has no temporal structure, so unlike a real utterance's
+    features (one window per output frame), idle only ever needs ONE window,
+    computed once at startup and reused on every idle tick -- extracted from
+    a short silent clip's middle so gather_audio_window has real context on
+    both sides, the same as it would for a real (padded) clip."""
+    silent_wav = f"/tmp/idle_silence_{os.getpid()}.wav"
+    n = int(SAMPLE_RATE * 2.0)  # 2s of silence -- comfortably more than one window's context
+    with wave.open(silent_wav, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SAMPLE_RATE)
+        w.writeframes(b"\x00\x00" * n)
+    features = _extract_features(silent_wav)
+    os.remove(silent_wav)
+    mid = features.shape[0] // 2
+    return reshape_audio_feat(gather_audio_window(features, mid)).unsqueeze(0).to(device)
+
+
 @app.get("/status")
 def status():
     return {"speaking": STATE.get("speaking", False), "pending": len(STATE.get("queue", []))}
@@ -365,12 +378,6 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--dataset", required=True)
     p.add_argument("--checkpoint", required=True)
-    p.add_argument("--idle_frame", type=int, default=0, help="resource frame index to hold on while idle, if no --idle_cache is given")
-    p.add_argument("--idle_cache", action="store_true",
-                   help="use the shared idle-loop cache (data/kjs/idle_cache.raw, built by build_idle_cache.py) "
-                        "instead of a single static idle frame")
-    p.add_argument("--idle_fps", type=float, default=9.0, help="idle-loop playback rate; throttled well below 25 "
-                   "since it's just a slow natural-motion loop, not real speech")
     p.add_argument("--fh_checkpoint", type=str, default="./feather_hubert.pth")
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--cpu_threads", type=int, default=2,
@@ -397,15 +404,6 @@ def main() -> None:
     hls_dir = os.path.join(os.getcwd(), f"hls_live_{args.port}")
     vfifo, afifo = _make_fifos(hls_dir)
 
-    idle_cache = None
-    idle_desc = f"static idle frame #{args.idle_frame}"
-    if args.idle_cache:
-        with open(os.path.join(args.dataset, "idle_cache.meta.json")) as f:
-            idle_meta = json.load(f)
-        idle_shape = (idle_meta["frame_count"], idle_meta["height"], idle_meta["width"], idle_meta["channels"])
-        idle_cache = np.memmap(os.path.join(args.dataset, "idle_cache.raw"), dtype=np.uint8, mode="r", shape=idle_shape)
-        idle_desc = f"shared idle-loop cache ({idle_meta['frame_count']} frames, resource {idle_meta['resource_start']}-{idle_meta['resource_end']}) at {args.idle_fps} fps"
-
     STATE.update({
         "device": device,
         "image_dir": image_dir,
@@ -413,9 +411,6 @@ def main() -> None:
         "model": load_model(args.checkpoint, device),
         "fh_model": _fh.load_feather_hubert(args.fh_checkpoint, device=device),
         "picker": FramePicker(frame_count),
-        "idle_frame_idx": args.idle_frame,
-        "idle_cache": idle_cache,
-        "idle_fps": args.idle_fps,
         "queue": deque(),
         "interrupt": False,
         "speaking": False,
@@ -425,8 +420,10 @@ def main() -> None:
         "ws_clients": [],
         "init_segment": None,
     })
+    STATE["idle_audio_feat"] = _make_idle_audio_feat(device)
 
-    print(f"[live] {frame_count} resource frames, {width}x{height}, {idle_desc}", flush=True)
+    print(f"[live] {frame_count} resource frames, {width}x{height}, "
+          f"idle runs the model continuously (silent audio, same picker as speech)", flush=True)
 
     ffmpeg_proc = _start_ffmpeg(hls_dir, vfifo, afifo, width, height, args.cpu_threads)
     STATE["ffmpeg"] = ffmpeg_proc
